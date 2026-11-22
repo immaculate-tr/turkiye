@@ -1,0 +1,122 @@
+name: Yerler RSS (Vikipedi)
+
+on:
+  schedule:
+    - cron: "23 4 * * *"     # 07:23 (TSİ)
+    - cron: "23 16 * * *"    # 19:23 (TSİ)
+  workflow_dispatch:
+    inputs:
+      kontrol:
+        description: "Yalnızca kategorileri doğrula ve raporla (makale üretme, yayın yapma)"
+        type: boolean
+        default: false
+      count:
+        description: "Bu çalışmada en fazla yeni makale (boş = varsayılan 10)"
+        required: false
+      havuz:
+        description: "Aday havuzunu yeniden çıkar"
+        type: boolean
+        default: false
+
+# Depoya hiçbir şey yazılmaz; yalnızca rss.xml GitHub Pages'e dağıtılır.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: yerler-rss
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PYTHONUTF8: "1"
+      # İsteğe bağlı ayarlar (açmak için başındaki # işaretini kaldırın):
+      # PER_RUN: "10"            # her çalışmada üretilecek makale sayısı
+      # FEED_ITEMS: "100"        # RSS'te kalan en yeni makale sayısı
+      # FEED_MAX_MB: "25"        # rss.xml en büyük boyutu
+      # MAX_IMAGES: "80"         # makale başına en çok görsel
+      # FOLLOW_MAIN: "1"         # "Ana madde" ile bağlı ayrıntılı maddeleri de ekle (0 = kapalı)
+      # CATS_ILCE: "Kategori adı 1|Kategori adı 2"   # bir grubun kategori adlarını elle belirtmek için (CATS_IL, CATS_TURKIYE, CATS_DUNYA, CATS_HARIKALAR)
+    steps:
+      - uses: actions/checkout@v4
+
+      # RSS adresi bu depodan otomatik belirlenir: https://KULLANICI.github.io/DEPO/rss.xml
+      - name: Site adresini belirle
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          name="${GITHUB_REPOSITORY#*/}"
+          if [ "${name,,}" = "$owner.github.io" ]; then url="https://$owner.github.io"; else url="https://$owner.github.io/$name"; fi
+          echo "SITE_URL=$url" >> "$GITHUB_ENV"
+          echo "WIKI_CONTACT=https://github.com/$GITHUB_REPOSITORY" >> "$GITHUB_ENV"
+          echo "RSS adresi: $url/rss.xml" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Bağımlılıkları kur
+        run: pip install -r requirements.txt
+
+      # Yayımlanan maddelerin kaydı (data/index.json) ve aday havuzu git yerine önbellekte tutulur
+      - name: Önceki durumu geri yükle
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: yer-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            yer-
+
+      - name: Testler
+        run: python -m unittest tests.test_yerler
+
+      - name: Kategori kontrolü
+        if: ${{ inputs.kontrol == true }}
+        run: python yerlerrss.py --kontrol
+
+      - name: RSS ve makaleleri üret
+        id: gen
+        if: ${{ inputs.kontrol != true }}
+        env:
+          IN_COUNT: ${{ inputs.count }}
+          IN_POOL: ${{ inputs.havuz }}
+        run: |
+          mkdir -p data/content
+          args=()
+          [ -n "$IN_COUNT" ] && args+=(--count "$IN_COUNT")
+          [ "$IN_POOL" = "true" ] && args+=(--havuzu-yenile)
+          python yerlerrss.py "${args[@]}"
+
+      - name: Durumu önbelleğe kaydet
+        if: ${{ always() && steps.gen.conclusion != 'skipped' }}
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: yer-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Yayın klasörünü hazırla
+        if: ${{ inputs.kontrol != true }}
+        run: |
+          mkdir -p _site
+          cp rss.xml _site/rss.xml
+
+      - uses: actions/upload-pages-artifact@v3
+        if: ${{ inputs.kontrol != true }}
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    if: ${{ inputs.kontrol != true }}
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.dep.outputs.page_url }}
+    steps:
+      - id: dep
+        uses: actions/deploy-pages@v4
