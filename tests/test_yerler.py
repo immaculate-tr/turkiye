@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import os
 import shutil
 import sys
@@ -120,14 +121,25 @@ IMAGES = {
 
 
 class FakeWiki:
-    def __init__(self, pages=None, cats=None, search=None, images=None, coords=None, redirects=None):
+    def __init__(self, pages=None, cats=None, search=None, images=None, coords=None, redirects=None, wd=None):
         self.redirects = redirects or {}
+        self.wd = wd or {}
+        self.sparql_calls = []
         self.pages = pages if pages is not None else {}
         self.cats = cats or {}
         self.search = search or {}
         self.images = IMAGES if images is None else images
         self.coords = coords or {}
         self.log = []
+
+    def sparql(self, query):
+        self.sparql_calls.append(query)
+        titles = []
+        for lbl in re.findall(r'"([^"]+)"@en', query):
+            titles += self.wd.get(lbl, [])
+        if "ERROR" in self.wd:
+            raise OSError("wikidata kapalı")
+        return {"results": {"bindings": [{"title": {"value": t}} for t in dict.fromkeys(titles)]}}
 
     def __call__(self, p):
         self.log.append(p)
@@ -159,13 +171,20 @@ class FakeWiki:
                 n = t.split(":", 1)[1]
                 pages.append({"title": t, **({"imageinfo": [self.images[n]]} if n in self.images else {"missing": True})})
             return {"query": {"pages": pages}}
-        if p.get("action") == "query" and "titles" in p and not p.get("prop") and not p.get("list"):
+        if p.get("action") == "query" and "titles" in p and p.get("prop") in (None, "pageprops") and not p.get("list"):
             pages, redirs = [], []
             for tt in p["titles"].split("|"):
                 final = self.redirects.get(tt, tt)
                 if final != tt:
                     redirs.append({"from": tt, "to": final})
-                pages.append({"title": final, **({} if final in self.pages else {"missing": True})})
+                pg = {"title": final}
+                if final not in self.pages:
+                    pg["missing"] = True
+                else:
+                    pp = self.pages[final].get("properties") if isinstance(self.pages[final], dict) else None
+                    if isinstance(pp, dict) and "disambiguation" in pp:
+                        pg["pageprops"] = {"disambiguation": ""}
+                pages.append(pg)
             return {"query": {"pages": pages, "redirects": redirs}}
         raise AssertionError(f"beklenmeyen istek: {p}")
 
@@ -175,7 +194,7 @@ def page(title, pid, text=SAMPLE, props=None, revid=777):
 
 
 def api_for(fake):
-    return y.Api(transport=fake, sleep=lambda s: None, min_interval=0)
+    return y.Api(transport=fake, sleep=lambda s: None, min_interval=0, sparql=fake.sparql)
 
 
 def read_text(path):
@@ -290,7 +309,8 @@ class TestArticle(Base):
         (rec, body), fake = self.build()
         self.assertEqual((rec["id"], rec["pageid"], rec["group"]), ("yer-4242", 4242, "il"))
         self.assertEqual(rec["link"], "https://tr.wikipedia.org/wiki/Hatay")
-        self.assertEqual(rec["categories"], ["Türkiye'nin İlleri", "Vikipedi"])
+        self.assertEqual(rec["categories"], ["Türkiye'nin İlleri", "Hatay", "Türkiye"])
+        self.assertEqual(rec["title"], "Hatay İli: Tarih, Nüfus ve Mutfak")                # yalnızca gerçekten var olan bölümler
         self.assertTrue(body.lstrip().startswith("<figure"))                       # kapak = bilgi kutusu görseli
         self.assertIn("Hatay panorama.jpg".replace(" ", "_"), body)
         self.assertIn("1280px-Hatay_panorama.jpg", body)                           # yüksek çözünürlük (thumb 1280)
@@ -333,7 +353,7 @@ class TestArticle(Base):
     def test_no_images_still_publishes(self):
         text = '<div class="mw-parser-output"><p>' + LONG * 3 + "</p></div>"
         fake = FakeWiki(pages={"Hatay": page("Hatay", 1, text=text)})
-        rec, body = y.build_article(api_for(fake), "Hatay", "il", NOW)
+        rec, body = y.build_article(api_for(fake), "Hatay", "dunya", NOW)
         self.assertIsNone(rec["image"])
         self.assertEqual(rec["images"], 0)
         self.assertFalse(any(p.get("prop") == "imageinfo" for p in fake.log))
@@ -350,26 +370,52 @@ class TestArticle(Base):
 
 class TestDiscovery(Base):
     def cats(self):
-        return {"Türkiye'nin illeri": {"pages": ["Adana", "Hatay", "Liste: İller", "Ankara"]},
+        return {"Türkiye'nin illeri": {"pages": ["Adana", "Hatay", "Liste: İller", "Ankara", "ISO 3166-2:TR"]},
                 "Türkiye'nin ilçeleri": {"pages": ["Seyhan"], "subs": ["Adana'nın ilçeleri", "Hatay'ın ilçeleri"]},
                 "Adana'nın ilçeleri": {"pages": ["Çukurova", "Kozan"], "subs": ["Derin"]},
                 "Hatay'ın ilçeleri": {"pages": ["Defne", "Antakya", "Seyhan"]},
                 "Derin": {"pages": ["ÇokDerin"]}}
 
-    def test_discover(self):
+    def test_il_ilce_come_from_wikidata_not_categories(self):
+        fake = FakeWiki(cats=self.cats(), wd={"province of Turkey": ["Hatay", "Adana", "Ankara"],
+                                              "district of Turkey": ["Seyhan", "Çukurova"],
+                                              "central district of Turkey": ["Antakya", "Seyhan"]})
+        groups, report = y.discover(api_for(fake), self.log.append)
+        self.assertEqual(groups["il"], ["Adana", "Ankara", "Hatay"])                    # kategorideki ISO sayfası/liste yok
+        self.assertEqual(groups["ilce"], ["Antakya", "Çukurova", "Seyhan"])
+        self.assertFalse(any(p.get("list") == "categorymembers" and "illeri" in p["cmtitle"] for p in fake.log))
+        self.assertEqual(report["il"]["bulunan"][0]["madde"], 3)
+        self.assertTrue(any(n.startswith("uyarı: yaklaşık 81") for n in report["il"]["not"]))
+        self.assertIn("province of Turkey", fake.sparql_calls[0])
+        self.assertIn("tr.wikipedia.org", fake.sparql_calls[0])
+
+    def test_colon_pages_never_candidates(self):
+        fake = FakeWiki(cats={"Türkiye'deki görülecek yerler": {"pages": ["Ayasofya", "ISO 3166-2:TR", "Efes"]}})
+        groups, _ = y.discover(api_for(fake), self.log.append)
+        self.assertEqual(groups["turkiye"], ["Ayasofya", "Efes"])
+
+    def test_il_fallback_to_names_when_wikidata_down(self):
+        pages = {"Adana": {"properties": {"x": 1}}, "Ankara": {"properties": {"disambiguation": ""}},
+                 "Ankara (il)": {"properties": {}}, "Hatay": {}}
+        fake = FakeWiki(pages=pages, wd={"ERROR": 1}, cats=self.cats())
+        groups, report = y.discover(api_for(fake), self.log.append)
+        self.assertEqual(groups["il"], ["Adana", "Ankara (il)", "Hatay"])               # anlam ayrımı atlandı, "(il)" seçildi
+        self.assertTrue(any("Wikidata sorgusu" in n for n in report["il"]["not"]))
+        self.assertTrue(any(n.startswith("il maddesi bulunamadı") for n in report["il"]["not"]))
+        # ilçe: Wikidata yok -> kategori yedeği
+        self.assertEqual(groups["ilce"], ["Antakya", "ÇokDerin", "Çukurova", "Defne", "Kozan", "Seyhan"])
+
+    def test_discover_categories_for_other_groups(self):
         fake = FakeWiki(cats=self.cats(), search={"Türkiye görülecek yerler": ["Kategori:Türkiye turizmi"]},
                         pages={"Giza Piramidi": {}, "Petra": {}, "Olympia'daki Zeus Heykeli": {}},
-                        redirects={"Zeus Heykeli": "Olympia'daki Zeus Heykeli"})
+                        redirects={"Zeus Heykeli": "Olympia'daki Zeus Heykeli"},
+                        wd={"province of Turkey": ["Adana"], "district of Turkey": ["Seyhan"]})
         groups, report = y.discover(api_for(fake), self.log.append)
-        self.assertEqual(groups["il"], ["Adana", "Ankara", "Hatay"])                 # Liste: elendi, sıralı
-        # derinlik 2: Derin alt kategorisi dahil, Seyhan tekil, Türkçe alfabe sırası (Ç, D'den önce)
-        self.assertEqual(groups["ilce"], ["Antakya", "ÇokDerin", "Çukurova", "Defne", "Kozan", "Seyhan"])
         self.assertEqual(groups["turkiye"], [])
         self.assertIn("öneri: Kategori:Türkiye turizmi", " ".join(report["turkiye"]["not"]))
         self.assertTrue(any("yok/boş: Kategori:Dünyada görülecek yerler" in n for n in report["dunya"]["not"]))
         self.assertEqual(groups["harikalar"], ["Giza Piramidi", "Petra", "Zeus Heykeli"])   # yalnızca var olan başlıklar (yönlendirme çözülür)
         self.assertTrue(any(n.startswith("maddesi yok:") and "Tac Mahal" in n for n in report["harikalar"]["not"]))
-        self.assertEqual(report["il"]["bulunan"], [{"kategori": "Türkiye'nin illeri", "madde": 4}])
 
     def test_env_override(self):
         os.environ["CATS_DUNYA"] = "Özel kategori|Yok kategori"
@@ -408,7 +454,7 @@ class TestPipeline(Base):
     def fake(self, **kw):
         pages = {"Hatay": page("Hatay", 1), "Adana": page("Adana", 2), "Hatay (il)": page("Hatay", 1),
                  "Mersin": page("Mersin", 3, props={"disambiguation": ""}), "Kısa": page("Kısa", 4, text='<p>kısa</p>')}
-        return FakeWiki(pages=pages, cats={"Türkiye'nin illeri": {"pages": ["Hatay", "Adana", "Mersin", "Kısa", "Hatay (il)", "Yok"]}},
+        return FakeWiki(pages=pages, wd={"province of Turkey": ["Hatay", "Adana", "Mersin", "Kısa", "Hatay (il)", "Yok"]},
                         coords={"Hatay": (36.2, 36.1)}, **kw)
 
     def run_it(self, fake, now=NOW, **kw):
@@ -421,7 +467,7 @@ class TestPipeline(Base):
         root, items = self.items()
         self.assertEqual({i.find("guid").text for i in items}, {"yer-1", "yer-2"})
         it = next(i for i in items if i.find("link").text == "https://tr.wikipedia.org/wiki/Hatay")
-        self.assertEqual(it.find("title").text, "Hatay İli: Tarih, Coğrafya, Nüfus ve Kültür")
+        self.assertEqual(it.find("title").text, "Hatay İli: Tarih, Nüfus ve Mutfak")
         enc = it.find("c:encoded", NS).text
         self.assertIn("<h2>Tarihçe</h2>", enc)
         self.assertTrue(it.find("m:content", NS).attrib["url"].startswith("https://upload.wikimedia.org/"))
@@ -470,7 +516,7 @@ class TestPipeline(Base):
                 calls["n"] += 1
                 raise urllib.error.HTTPError("u", 500, "x", {}, io.BytesIO(b"{}"))
             return fake(p)
-        api = y.Api(transport=transport, sleep=lambda s: None, min_interval=0, retries=2)
+        api = y.Api(transport=transport, sleep=lambda s: None, min_interval=0, retries=2, sparql=fake.sparql)
         res = y.run(root=self.root, api=api, now=NOW, log=self.log.append)
         self.assertEqual(res["new"], 0)
         self.assertLessEqual(calls["n"], 5 * 2)                                       # ardışık hata sınırı
@@ -544,7 +590,8 @@ class TestMainArticles(Base):
             "Hatay": page("Hatay", 1, text=MAIN_PAGE), "Hatay tarihi": page("Hatay tarihi", 11, text=SUB_TARIH, revid=88),
             "Hatay mutfağı": page("Hatay mutfağı", 12, text=SUB_MUTFAK, revid=99),
             "Belirsiz": page("Belirsiz", 13, text=SUB_MUTFAK, props={"disambiguation": ""}),
-            "Kısa madde": page("Kısa madde", 14, text="<p>kısa</p>"), "Ic ice": page("İç içe madde", 15, text=SUB_MUTFAK)})
+            "Kısa madde": page("Kısa madde", 14, text="<p>kısa</p>"), "Ic ice": page("İç içe madde", 15, text=SUB_MUTFAK)},
+            coords={"Hatay": (36.2, 36.1)})
 
     def build(self, fake=None, group="il"):
         fake = fake or self.fake()
@@ -607,11 +654,38 @@ class TestMainArticles(Base):
 class TestTitlesAndTransport(Base):
     def test_titles(self):
         self.assertEqual(y.display_name("Hatay (il)"), "Hatay")
-        self.assertEqual(y.feed_title("il", "Hatay", []), "Hatay İli: Tarih, Coğrafya, Nüfus ve Kültür")
-        self.assertEqual(y.feed_title("ilce", "Antakya", [("İl", "Hatay")]), "Antakya (Hatay) İlçesi: Tarih, Coğrafya, Nüfus ve Kültür")
-        self.assertEqual(y.feed_title("ilce", "Defne", []), "Defne İlçesi: Tarih, Coğrafya, Nüfus ve Kültür")
-        self.assertEqual(y.feed_title("harikalar", "Petra", []), "Petra")
+        full = ["Tarihçe", "Coğrafya", "İklim", "Nüfus", "Ekonomi", "Kültür", "Mutfak", "Gezilecek yerler", "Belediye"]
+        t = y.feed_title("il", "Hatay", [], full)
+        self.assertLessEqual(len(t), y.TITLE_LIMIT)                                         # arama sonucunda kesilmez
+        self.assertTrue(t.startswith("Hatay İli: Tarih, "))
+        self.assertIn("Nüfus", t)
+        self.assertEqual(y.feed_title("il", "Van", [], ["Tarihçe", "Nüfus"]), "Van İli: Tarih ve Nüfus")
+        self.assertEqual(y.feed_title("ilce", "Antakya", [("İl", "Hatay")], ["Tarih", "Nüfus", "Mutfak"]),
+                         "Antakya (Hatay) İlçesi: Tarih, Nüfus ve Mutfak")
+        self.assertEqual(y.feed_title("ilce", "Defne", [], ["Coğrafya"]), "Defne İlçesi: Coğrafya ve Genel Bilgiler")
+        self.assertEqual(y.feed_title("ilce", "Kale", [], []), "Kale İlçesi: Genel Bilgiler")
+        self.assertEqual(y.feed_title("il", "Hatay (il)", [], ["Tarih", "Coğrafya"]), "Hatay İli: Tarih ve Coğrafya")
+        self.assertEqual(y.feed_title("harikalar", "Petra", [], ["Tarih", "Mimari yapı", "Ziyaret"]), "Petra: Tarihçe, Mimari ve Ziyaret Bilgileri")
+        self.assertEqual(y.feed_title("harikalar", "Petra", [], []), "Petra Hakkında Genel Bilgiler")
         self.assertEqual(y.tr_lower("İzmir ILIK"), "izmir ılık")
+
+    def test_seo_description(self):
+        long_ = ("Hatay (Arapça: لواء; Hatay Eyaleti), Türkiye'nin güneyinde, Akdeniz kıyısında yer alan bir ildir. "
+                 "Nüfusu ve tarihi zenginliğiyle bilinir. " + "Uzun bir cümle daha burada devam ediyor ve sürüyor. " * 5)
+        d = y.seo_description(long_)
+        self.assertTrue(d.startswith("Hatay, Türkiye'nin güneyinde"))
+        self.assertNotIn("(", d)
+        self.assertLessEqual(len(d), 155)
+        self.assertTrue(d.endswith("."))                                                    # cümle sonunda bitti
+        self.assertEqual(y.seo_description("Kısa metin [1] burada."), "Kısa metin burada.")
+        self.assertTrue(y.seo_description("kelime " * 100).endswith("…"))
+
+    def test_labels(self):
+        self.assertEqual(y.feed_labels("il", "Türkiye'nin İlleri", "Hatay (il)", []), ["Türkiye'nin İlleri", "Hatay", "Türkiye"])
+        self.assertEqual(y.feed_labels("ilce", "Türkiye'nin İlçeleri", "Antakya", [("İl", "Hatay")]),
+                         ["Türkiye'nin İlçeleri", "Hatay", "Antakya", "Türkiye"])
+        self.assertEqual(y.feed_labels("ilce", "Türkiye'nin İlçeleri", "Defne", []), ["Türkiye'nin İlçeleri", "Defne", "Türkiye"])
+        self.assertEqual(y.feed_labels("dunya", "Dünyada Görülecek Yerler", "Petra", []), ["Dünyada Görülecek Yerler", "Petra"])
 
     def test_post_for_long_requests(self):
         seen = []
@@ -668,6 +742,70 @@ class TestTitlesAndTransport(Base):
         self.assertEqual(read_json(os.path.join(self.root, "data", "index.json"))["skips"]["Adana"]["r"], "hata")
 
 
+class TestPlaceValidation(Base):
+    ISO = ('<div class="mw-parser-output"><p>ISO 3166-2:TR, Türkiye\'deki ana bölümlerin isimlerini kodlamaya yarayan bir koddur. '
+           + LONG * 4 + '</p><table class="wikitable"><tr><th>Kod</th><th>Alt bölüm</th></tr><tr><td>TR-01</td><td>Adana</td></tr></table></div>')
+
+    def setUp(self):
+        super().setUp()
+        self._groups = y.GROUPS
+        y.GROUPS = [{**g, "titles": []} for g in y.GROUPS]
+
+    def tearDown(self):
+        y.GROUPS = self._groups
+        super().tearDown()
+
+    def test_code_list_page_rejected_for_il(self):
+        fake = FakeWiki(pages={"Kod sayfası": page("Kod sayfası", 5, text=self.ISO)})
+        self.assertEqual(y.build_article(api_for(fake), "Kod sayfası", "il", NOW), (None, "yer_degil"))
+        self.assertEqual(y.build_article(api_for(fake), "Kod sayfası", "ilce", NOW), (None, "yer_degil"))
+        rec, body = y.build_article(api_for(fake), "Kod sayfası", "dunya", NOW)             # diğer gruplarda doğrulama yok
+        self.assertIsNotNone(rec)
+
+    def test_signals(self):
+        self.assertTrue(y.place_signals([("Nüfus", "1")], None))
+        self.assertTrue(y.place_signals([("Yüzölçümü", "9 km²")], None))
+        self.assertTrue(y.place_signals([], (36.0, 36.0)))
+        self.assertFalse(y.place_signals([("Kod", "TR")], None))
+
+    def test_permanent_skip_and_purge_and_pool_version(self):
+        fake = FakeWiki(pages={"Hatay": page("Hatay", 1), "Kod sayfası": page("Kod sayfası", 5, text=self.ISO)},
+                        wd={"province of Turkey": ["Hatay", "Kod sayfası"]}, coords={"Hatay": (36.2, 36.1)})
+        res = y.run(root=self.root, api=api_for(fake), now=NOW, log=self.log.append)
+        idx = read_json(os.path.join(self.root, "data", "index.json"))
+        self.assertEqual(res["new"], 1)
+        self.assertEqual(idx["skips"]["Kod sayfası"], {"n": 99, "r": "yer_degil"})
+        # eski sürüm kayıtlar: ':' içeren yardımcı sayfa ve doğrulanmamış v1 il kaydı çıkarılır
+        old_html = os.path.join(self.root, "data", "content", "9.html")
+        old_html2 = os.path.join(self.root, "data", "content", "8.html")
+        for pth in (old_html, old_html2):
+            with open(pth, "w", encoding="utf-8") as fh:
+                fh.write("<p>eski</p>")
+        base = {"pub": "2026-11-20T00:00:00Z", "date": "2026-11-20", "link": "x", "description": "d", "categories": ["a"],
+                "image": None, "title": "t"}
+        idx["articles"] += [
+            {**base, "id": "yer-9", "pageid": 9, "wiki_title": "ISO 3166-2:TR", "group": "il", "v": 1, "content_file": "data/content/9.html"},
+            {**base, "id": "yer-8", "pageid": 8, "wiki_title": "Eski il", "group": "il", "v": 1, "content_file": "data/content/8.html"}]
+        with open(os.path.join(self.root, "data", "index.json"), "w", encoding="utf-8") as fh:
+            json.dump(idx, fh)
+        y.run(root=self.root, api=api_for(fake), now=NOW + timedelta(hours=1), log=self.log.append)
+        idx2 = read_json(os.path.join(self.root, "data", "index.json"))
+        self.assertEqual(sorted(a["pageid"] for a in idx2["articles"]), [1])
+        self.assertEqual(idx2["skips"]["ISO 3166-2:TR"]["r"], "gecersiz")
+        self.assertFalse(os.path.exists(old_html) or os.path.exists(old_html2))
+        self.assertTrue(any("yardımcı sayfa" in m for m in self.log))
+        # eski sürümlü havuz yeniden çıkarılır
+        pool_path = os.path.join(self.root, "data", "pool.json")
+        pool = read_json(pool_path)
+        pool["v"] = 1
+        with open(pool_path, "w", encoding="utf-8") as fh:
+            json.dump(pool, fh)
+        before = len(fake.sparql_calls)
+        y.run(root=self.root, api=api_for(fake), now=NOW + timedelta(hours=2), log=self.log.append)
+        self.assertGreater(len(fake.sparql_calls), before)
+        self.assertEqual(read_json(pool_path)["v"], y.POOL_VERSION)
+
+
 class TestClientAndMain(Base):
     def test_retries(self):
         seq = [urllib.error.HTTPError("u", 429, "x", {"Retry-After": "3"}, io.BytesIO(b"{}")),
@@ -699,7 +837,7 @@ class TestClientAndMain(Base):
     def test_main_exit_codes(self):
         import contextlib
         saved = y.Api
-        make = lambda fake: (lambda: saved(transport=fake, sleep=lambda s: None, min_interval=0))
+        make = lambda fake: (lambda: saved(transport=fake, sleep=lambda s: None, min_interval=0, sparql=fake.sparql))
         try:
             y.Api = make(FakeWiki(pages={"Hatay": page("Hatay", 1)}, cats={"Türkiye'nin illeri": {"pages": ["Hatay"]}}))
             with contextlib.redirect_stdout(io.StringIO()):
