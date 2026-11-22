@@ -75,7 +75,20 @@ MAX_SUB = _int("MAX_SUB", 6)                     # makale başına en çok "Ana 
 SUB_MIN_CHARS = _int("SUB_MIN_CHARS", 600)       # bundan kısa ayrıntılı maddeler eklenmez
 SUB_MAX_CHARS = _int("SUB_MAX_CHARS", 80000)     # tek ayrıntılı maddeden en çok metin (bölüm sınırında kesilir)
 TOTAL_MAX_CHARS = _int("TOTAL_MAX_CHARS", 500000)  # makalenin toplam metin sınırı (aşılınca yeni ayrıntılı madde eklenmez)
-BUILD_VERSION = 1
+BUILD_VERSION = 2          # 2: il/ilçe listesi Wikidata'dan, yer doğrulaması eklendi
+POOL_VERSION = 2
+SPARQL_URL = "https://query.wikidata.org/sparql"
+IL_NAMES = [
+    "Adana", "Adıyaman", "Afyonkarahisar", "Ağrı", "Aksaray", "Amasya", "Ankara", "Antalya", "Ardahan", "Artvin", "Aydın",
+    "Balıkesir", "Bartın", "Batman", "Bayburt", "Bilecik", "Bingöl", "Bitlis", "Bolu", "Burdur", "Bursa", "Çanakkale",
+    "Çankırı", "Çorum", "Denizli", "Diyarbakır", "Düzce", "Edirne", "Elazığ", "Erzincan", "Erzurum", "Eskişehir",
+    "Gaziantep", "Giresun", "Gümüşhane", "Hakkâri", "Hatay", "Iğdır", "Isparta", "İstanbul", "İzmir", "Kahramanmaraş",
+    "Karabük", "Karaman", "Kars", "Kastamonu", "Kayseri", "Kilis", "Kırıkkale", "Kırklareli", "Kırşehir", "Kocaeli",
+    "Konya", "Kütahya", "Malatya", "Manisa", "Mardin", "Mersin", "Muğla", "Muş", "Nevşehir", "Niğde", "Ordu", "Osmaniye",
+    "Rize", "Sakarya", "Samsun", "Şanlıurfa", "Siirt", "Sinop", "Sivas", "Şırnak", "Tekirdağ", "Tokat", "Trabzon",
+    "Tunceli", "Uşak", "Van", "Yalova", "Yozgat", "Zonguldak",
+]
+PLACE_LABEL = re.compile(r"nüfus|yüzölçüm|plaka|posta kodu|alan kodu|rakım|yüksekliğ", re.I)
 
 # Gruplar: cats = denenecek kategori adları (varolanların hepsi birleştirilir), titles = doğrudan madde adları.
 # Ortam değişkeniyle değiştirilebilir: CATS_ILCE="Kategori adı 1|Kategori adı 2"
@@ -89,10 +102,12 @@ GROUPS = [
      "cats": ["Türkiye'deki görülecek yerler", "Türkiye'de görülecek yerler"], "titles": []},
     {"key": "dunya", "label": "Dünyada Görülecek Yerler", "depth": 2, "search": "Dünyada görülecek yerler",
      "cats": ["Dünyada görülecek yerler", "Dünyadaki görülecek yerler"], "titles": []},
+    # il/ilçe listesi kategoriden değil Wikidata'dan alınır (kategoriler "ISO 3166-2:TR" gibi yardımcı sayfalar içerir)
     {"key": "il", "label": "Türkiye'nin İlleri", "depth": 0, "search": "Türkiye'nin illeri",
-     "cats": ["Türkiye'nin illeri", "Türkiye illeri"], "titles": []},
+     "cats": ["Türkiye'nin illeri", "Türkiye illeri"], "titles": [], "wd": ["province of Turkey"], "names": IL_NAMES, "expect": 81},
     {"key": "ilce", "label": "Türkiye'nin İlçeleri", "depth": 2, "search": "Türkiye'nin ilçeleri",
-     "cats": ["Türkiye'nin ilçeleri", "Türkiye ilçeleri"], "titles": []},
+     "cats": ["Türkiye'nin ilçeleri", "Türkiye ilçeleri"], "titles": [],
+     "wd": ["district of Turkey", "central district of Turkey", "metropolitan district of Turkey"], "expect": 970},
 ]
 SKIP_TITLE = re.compile(r"^(liste|kategori|şablon|vikipedi|portal|yardım)\b|\blistesi$|\bkategorisi$", re.I)
 STOP_SECTIONS = {
@@ -148,9 +163,21 @@ def _transport(params):
     return json.loads(raw.decode("utf-8"))
 
 
+def _sparql_transport(query):
+    url = f"{SPARQL_URL}?{urllib.parse.urlencode({'query': query, 'format': 'json'})}"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/sparql-results+json",
+                                               "Accept-Encoding": "gzip"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        raw = resp.read()
+        if resp.headers.get("Content-Encoding") == "gzip":
+            raw = gzip.decompress(raw)
+    return json.loads(raw.decode("utf-8"))
+
+
 class Api:
-    def __init__(self, transport=None, sleep=time.sleep, min_interval=0.25, retries=5):
+    def __init__(self, transport=None, sleep=time.sleep, min_interval=0.25, retries=5, sparql=None):
         self.transport, self.sleep, self.min_interval, self.retries = transport or _transport, sleep, min_interval, retries
+        self.sparql_transport = sparql or _sparql_transport
         self._last, self.calls = 0.0, 0
 
     def _throttle(self):
@@ -210,21 +237,49 @@ class Api:
             cont = data["continue"]
         return pages, subs
 
-    def existing_titles(self, titles):
-        """İstenen başlıklardan Vikipedi'de gerçekten var olanlar (yönlendirmeler çözülür)."""
-        ok = set()
+    def title_status(self, titles):
+        """{istenen_başlık: "ok" | "disambig"}; olmayanlar sözlükte yer almaz (yönlendirmeler çözülür)."""
+        out = {}
         titles = list(dict.fromkeys(titles))
         for i in range(0, len(titles), 40):
             batch = titles[i:i + 40]
-            q = self.request({"action": "query", "titles": "|".join(batch), "redirects": "1"}).get("query", {})
+            q = self.request({"action": "query", "titles": "|".join(batch), "redirects": "1", "prop": "pageprops",
+                              "ppprop": "disambiguation"}).get("query", {})
             norm = {n["from"]: n["to"] for n in q.get("normalized", [])}
             red = {r["from"]: r["to"] for r in q.get("redirects", [])}
-            alive = {pg["title"] for pg in q.get("pages", []) if not pg.get("missing") and not pg.get("invalid")}
+            info = {pg["title"]: pg for pg in q.get("pages", []) if not pg.get("missing") and not pg.get("invalid")}
             for t in batch:
                 f = norm.get(t, t)
-                if red.get(f, f) in alive:
-                    ok.add(t)
-        return ok
+                pg = info.get(red.get(f, f))
+                if pg is not None:
+                    out[t] = "disambig" if "disambiguation" in (pg.get("pageprops") or {}) else "ok"
+        return out
+
+    def existing_titles(self, titles):
+        """İstenen başlıklardan Vikipedi'de gerçekten var olanlar (anlam ayrımı sayfaları hariç)."""
+        return {t for t, st in self.title_status(titles).items() if st == "ok"}
+
+    def sparql_titles(self, labels):
+        """Wikidata'da sınıfı verilen etiketlerden biri olan öğelerin Vikipedi (tr) madde adları."""
+        vals = " ".join(f'"{l}"@en' for l in labels)
+        q = ("SELECT DISTINCT ?title WHERE { VALUES ?lbl { %s } ?t rdfs:label ?lbl. ?item wdt:P31 ?t. "
+             "?a schema:about ?item; schema:isPartOf <%s/>; schema:name ?title. }" % (vals, WIKI_HOST))
+        last = None
+        for attempt in range(4):
+            try:
+                data = self.sparql_transport(q)
+            except urllib.error.HTTPError as e:
+                last = e
+                if e.code in (429, 500, 502, 503, 504):
+                    self._backoff(attempt, e.headers.get("Retry-After") if e.headers else None)
+                    continue
+                raise WikiError(f"Wikidata HTTP {e.code}") from e
+            except (OSError, http.client.HTTPException, EOFError, zlib.error, ValueError) as e:
+                last = e
+                self._backoff(attempt)
+                continue
+            return [r["title"]["value"] for r in data.get("results", {}).get("bindings", []) if r.get("title")]
+        raise WikiError(f"Wikidata sorgusu yanıt vermedi: {last}")
 
     def search_categories(self, term, limit=5):
         data = self.request({"action": "query", "list": "search", "srsearch": term, "srnamespace": "14",
@@ -304,23 +359,65 @@ def crawl_category(api, cat, depth, seen, log, first=None):
     return out
 
 
+def resolve_names(api, names, notes):
+    """il adlarını Vikipedi madde başlıklarına çevirir (düz ad, yoksa "Ad (il)"); anlam ayrımı sayfaları atlanır."""
+    cands = [c for n in names for c in (n, f"{n} (il)")]
+    st = api.title_status(cands)
+    out, miss = [], []
+    for n in names:
+        pick = next((c for c in (n, f"{n} (il)") if st.get(c) == "ok"), None)
+        (out.append(pick) if pick else miss.append(n))
+    if miss:
+        notes.append("il maddesi bulunamadı: " + ", ".join(miss))
+    return out
+
+
+def valid_candidate(t):
+    return bool(t) and ":" not in t and not SKIP_TITLE.search(t)
+
+
 def discover(api, log=print):
     """Tüm grupların aday başlıkları + rapor."""
     groups, report = {}, {}
     for g in GROUPS:
         found, titles, notes = [], [], []
-        for cat in group_cats(g):
+        env_cats = os.environ.get("CATS_" + g["key"].upper())
+        if g.get("wd") and not env_cats:                     # il / ilçe: Wikidata (kesin liste)
             try:
-                top = api.category_members(cat)
-                if not top[0] and not top[1]:
-                    notes.append(f"yok/boş: Kategori:{cat}")
-                    continue
-                got = crawl_category(api, cat, g["depth"], {cat}, log, first=top)
+                wd = api.sparql_titles(g["wd"])
             except WikiError as e:
-                notes.append(f"hata: Kategori:{cat}: {e}")
-                continue
-            found.append({"kategori": cat, "madde": len(got)})
-            titles += got
+                wd = []
+                notes.append(f"hata: Wikidata sorgusu: {e}")
+            wd = [t for t in dict.fromkeys(wd) if valid_candidate(t)]
+            if wd:
+                titles += wd
+                found.append({"kaynak": "Wikidata: " + " / ".join(g["wd"]), "madde": len(wd)})
+                if g.get("expect") and len(wd) < g["expect"] * 0.9:
+                    notes.append(f"uyarı: yaklaşık {g['expect']} bekleniyordu, {len(wd)} geldi")
+            else:
+                notes.append("Wikidata'dan madde gelmedi; yedek yönteme geçildi")
+                if g.get("names"):
+                    try:
+                        got = resolve_names(api, g["names"], notes)
+                    except WikiError as e:
+                        got = []
+                        notes.append(f"hata: il adları denetimi: {e}")
+                    if got:
+                        titles += got
+                        found.append({"kaynak": "il adları listesi", "madde": len(got)})
+        if not titles:
+            for cat in group_cats(g):
+                try:
+                    top = api.category_members(cat)
+                    if not top[0] and not top[1]:
+                        notes.append(f"yok/boş: Kategori:{cat}")
+                        continue
+                    got = crawl_category(api, cat, g["depth"], {cat}, log, first=top)
+                except WikiError as e:
+                    notes.append(f"hata: Kategori:{cat}: {e}")
+                    continue
+                found.append({"kategori": cat, "madde": len(got)})
+                titles += got
         if g["titles"]:
             try:
                 alive = api.existing_titles(g["titles"])
@@ -331,7 +428,7 @@ def discover(api, log=print):
             if gone:
                 notes.append("maddesi yok: " + ", ".join(gone))
             titles += [t for t in g["titles"] if t in alive]
-        titles = [t for t in dict.fromkeys(titles) if not SKIP_TITLE.search(t)]
+        titles = [t for t in dict.fromkeys(titles) if valid_candidate(t)]
         if not found and not g["titles"]:
             try:
                 sug = api.search_categories(g["search"])
@@ -341,8 +438,8 @@ def discover(api, log=print):
         groups[g["key"]] = sorted(titles, key=tr_sort_key)
         report[g["key"]] = {"etiket": g["label"], "bulunan": found, "not": notes, "toplam": len(groups[g["key"]]),
                             "örnek": groups[g["key"]][:5]}
-        log(f"grup {g['key']:10s} aday={len(groups[g['key']]):5d} kategoriler={[f['kategori'] for f in found] or 'YOK'}"
-            + (f"  {notes}" if notes else ""))
+        src = [f.get("kategori") or f.get("kaynak") for f in found] or "YOK"
+        log(f"grup {g['key']:10s} aday={len(groups[g['key']]):5d} kaynak={src}" + (f"  {notes}" if notes else ""))
     return groups, report
 
 
@@ -770,16 +867,77 @@ def display_name(title):
     return re.sub(r"\s*\((?:il|ilçe|şehir|belde|belediye|kasaba)\)$", "", title or "", flags=re.I).strip()
 
 
-def feed_title(group, name, rows):
+_IL_TOPICS = [
+    ("Tarih", r"\btarih"),
+    ("Coğrafya", r"coğrafya|iklim|jeoloji|yer şekilleri|bitki örtüsü|flora|fauna|akarsu"),
+    ("Nüfus", r"nüfus|demografi|halk yapısı"),
+    ("Ekonomi", r"ekonomi|tarım|sanayi|ticaret|hayvancılık|madencilik|balıkçılık"),
+    ("Kültür", r"kültür|folklor|halk oyun|gelenek|sanat|müzik|edebiyat|festival"),
+    ("Mutfak", r"mutfak|yemek|yöresel|lezzet"),
+    ("Gezilecek Yerler", r"gezilecek|görülecek|turizm|turistik|ören yeri|müze|ziyaret|doğal güzellik|plaj|kaplıca|yayla"),
+    ("Yönetim", r"yönetim|belediye|seçim|idari"),
+]
+_IL_DROP = ["Yönetim", "Ekonomi", "Gezilecek Yerler", "Mutfak", "Kültür", "Nüfus", "Coğrafya", "Tarih"]   # başlık uzarsa önce atılanlar
+_YER_TOPICS = [
+    ("Tarihçe", r"\btarih"),
+    ("Konum", r"konum|coğrafya|bulunduğu yer|iklim"),
+    ("Mimari", r"mimari|yapı|inşa|tasarım"),
+    ("Ziyaret Bilgileri", r"ziyaret|turizm|gezilecek|ulaşım|müze"),
+]
+_YER_DROP = ["Ziyaret Bilgileri", "Konum", "Mimari", "Tarihçe"]
+TITLE_LIMIT = 68                                          # arama sonuçlarında kesilmeyecek uzunluk (yaklaşık)
+
+
+def join_tr(items):
+    if not items:
+        return ""
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " ve " + items[-1]
+
+
+def pick_topics(heads, rules, drop, base):
+    low = [tr_lower(h) for h in heads]
+    topics = [name for name, rx in rules if any(re.search(rx, h) for h in low)]
+    while len(f"{base}: {join_tr(topics)}") > TITLE_LIMIT and len(topics) > 2:
+        for d in drop:
+            if d in topics:
+                topics.remove(d)
+                break
+    return topics
+
+
+def row_value(rows, labels):
+    return next((v for k, v in rows if k and tr_lower(k) in labels), "")
+
+
+def feed_title(group, name, rows, heads=()):
+    """Konu başlığı: makalenin gerçekten içerdiği bölümlerden (şablon cümle değil)."""
     name = display_name(name)
     if group == "il":
-        t = f"{name} İli: Tarih, Coğrafya, Nüfus ve Kültür"
+        base, rules, drop = f"{name} İli", _IL_TOPICS, _IL_DROP
     elif group == "ilce":
-        il = next((v for k, v in rows if k and tr_lower(k) in ("il", "ili", "bağlı olduğu il", "bulunduğu il")), "")
-        t = (f"{name} ({il}) İlçesi" if il else f"{name} İlçesi") + ": Tarih, Coğrafya, Nüfus ve Kültür"
+        il = row_value(rows, ("il", "ili", "bağlı olduğu il", "bulunduğu il"))
+        base, rules, drop = (f"{name} ({il}) İlçesi" if il else f"{name} İlçesi"), _IL_TOPICS, _IL_DROP
     else:
-        t = name
-    return t if len(t) <= 120 else name
+        base, rules, drop = name, _YER_TOPICS, _YER_DROP
+    topics = pick_topics(heads, rules, drop, base)
+    if len(topics) >= 2:
+        t = f"{base}: {join_tr(topics)}"
+    elif len(topics) == 1:
+        t = f"{base}: {topics[0]} ve Genel Bilgiler"
+    else:
+        t = f"{base}: Genel Bilgiler" if group in ("il", "ilce") else f"{base} Hakkında Genel Bilgiler"
+    return t if len(t) <= 120 else base
+
+
+def feed_labels(group, label, name, rows):
+    name = display_name(name)
+    if group == "il":
+        labels = [label, name, "Türkiye"]
+    elif group == "ilce":
+        labels = [label, row_value(rows, ("il", "ili", "bağlı olduğu il", "bulunduğu il")), name, "Türkiye"]
+    else:
+        labels = [label, name]
+    return [l for l in dict.fromkeys(x for x in labels if x)][:5]
 
 
 def block_chars(blocks):
@@ -870,6 +1028,11 @@ def expand_main(api, blocks, self_titles, log):
     return out, ctx["sources"]
 
 
+def place_signals(rows, coords):
+    """Gerçek bir yer maddesi mi: koordinatı ya da nüfus/yüzölçümü/plaka gibi bilgi kutusu satırı var mı."""
+    return bool(coords) or any(k and PLACE_LABEL.search(tr_lower(k)) for k, _ in rows)
+
+
 def build_article(api, title, group, now, log=print):
     """-> (rec, body) ya da (None, neden)."""
     parsed = api.parse(title)
@@ -883,6 +1046,9 @@ def build_article(api, title, group, now, log=print):
     blocks, rows, info_units = sanitize(parsed.get("text") or "", real_title)
     if block_chars(blocks) < MIN_TEXT_CHARS:
         return None, "taslak"
+    coords = api.coordinates(wiki_title)
+    if group in ("il", "ilce") and not place_signals(rows, coords):
+        return None, "yer_degil"                         # il/ilçe değil (kod listesi, yardımcı sayfa vb.)
     sources = []
     if FOLLOW_MAIN:
         blocks, sources = expand_main(api, blocks, {wiki_title, real_title, title}, log)
@@ -907,7 +1073,8 @@ def build_article(api, title, group, now, log=print):
     valid = [(f, cap) for f, cap in cands if infos.get(fkey(f)) and accept_image(infos[fkey(f)])]
     pick = next(((f, cap) for f, cap in valid if lead_ok(f, infos[fkey(f)])), valid[0] if valid else None)
     if pick:
-        r = render_fig(pick[0], pick[1], real_title)
+        cap_txt = strip_tags(pick[1])
+        r = render_fig(pick[0], pick[1], f"{display_name(real_title)} – {cap_txt}" if cap_txt else display_name(real_title))
         if r:
             lead_info, lead = r
 
@@ -918,7 +1085,7 @@ def build_article(api, title, group, now, log=print):
     def emit(items):
         for b in items:
             if b[0] == "h":
-                out.append(("h", b[1], f"<h{b[1]}>{esc(b[2])}</h{b[1]}>"))
+                out.append(("h", b[1], f"<h{b[1]}>{esc(b[2])}</h{b[1]}>", b[2]))
             elif b[0] == "html":
                 out.append(("t", b[1]))
             elif b[0] == "fig":
@@ -929,7 +1096,6 @@ def build_article(api, title, group, now, log=print):
     emit(blocks[:first_h])
 
     # künye (bilgi kutusu)
-    coords = api.coordinates(wiki_title)
     lines = []
     for label, val in rows:
         lines.append(f"<b>— {esc(val)} —</b>" if label is None else f"<b>{esc(label)}:</b> {esc(val)}")
@@ -938,21 +1104,21 @@ def build_article(api, title, group, now, log=print):
         lines.append(f'<b>Koordinatlar:</b> {lat:.5f}, {lon:.5f} (<a href="https://www.openstreetmap.org/?mlat={lat}&amp;mlon={lon}'
                      f'#map=12/{lat}/{lon}" rel="noopener" target="_blank">haritada aç</a>)')
     if lines:
-        out.append(("h", 2, f"<h2>{t} Künyesi</h2>"))
+        out.append(("h", 2, f"<h2>{t} Künyesi</h2>", None))
         out.append(("t", "<p>" + "<br />".join(lines) + "</p>"))
     extra_heading = bool(lines)
     for f, cap in info_units:                                   # bilgi kutusundaki diğer görseller (bayrak, harita, logo...)
         r = render_fig(f, cap, strip_tags(cap) or real_title)
         if r:
             if not extra_heading:
-                out.append(("h", 2, f"<h2>{t} Görselleri</h2>"))
+                out.append(("h", 2, f"<h2>{t} Görselleri</h2>", None))
                 extra_heading = True
             out.append(("t", r[1]))
 
     emit(blocks[first_h:])
 
     # boş başlıkları ayıkla
-    final, items = [], out
+    final, items, heads = [], out, []
     for i, it in enumerate(items):
         if it[0] == "h":
             lvl, j, has = it[1], i + 1, False
@@ -966,6 +1132,8 @@ def build_article(api, title, group, now, log=print):
             if not has:
                 continue
             final.append(it[2])
+            if it[3]:
+                heads.append(it[3])
         else:
             final.append(it[1])
 
@@ -984,19 +1152,34 @@ def build_article(api, title, group, now, log=print):
     body = "\n".join(final) + "\n"
 
     lead_p = next((b[1] for b in blocks if b[0] == "html" and b[1].startswith("<p>")), "")
-    desc = shorten(strip_tags(lead_p) or real_title)
+    desc = seo_description(strip_tags(lead_p) or real_title)
     stamp = lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     gdef = next(g for g in GROUPS if g["key"] == group)
     rec = {
-        "id": f"yer-{pageid}", "pageid": pageid, "title": feed_title(group, real_title, rows), "wiki_title": wiki_title,
+        "id": f"yer-{pageid}", "pageid": pageid, "title": feed_title(group, real_title, rows, heads), "wiki_title": wiki_title,
         "group": group, "v": BUILD_VERSION, "pub": stamp(now), "date": now.strftime("%Y-%m-%d"), "revid": revid,
-        "link": link, "description": desc, "categories": [gdef["label"], "Vikipedi"],
+        "link": link, "description": desc, "categories": feed_labels(group, gdef["label"], real_title, rows),
         "image": ({"url": lead_info.get("thumburl") or lead_info.get("url"),
                    "width": int(lead_info.get("thumbwidth") or lead_info.get("width") or 0),
                    "height": int(lead_info.get("thumbheight") or lead_info.get("height") or 0)} if lead_info else None),
         "images": count, "subs": len(sources), "content_file": f"data/content/{pageid}.html",
     }
     return rec, body
+
+
+def seo_description(text, limit=155):
+    """Meta açıklama: parantez içi (okunuş, Arapça yazılış vb.) atılır, mümkünse cümle sonunda biter (~80-155 karakter)."""
+    t = collapse(text)
+    for _ in range(3):
+        t = re.sub(r"\s*\([^()]*\)", "", t)
+    t = collapse(re.sub(r"\s+([,.;:])", r"\1", re.sub(r"\[[^\]]*\]", "", t)))
+    if len(t) <= limit:
+        return t
+    cut = t[:limit]
+    end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    if end >= 80:
+        return cut[:end + 1]
+    return shorten(t, limit)
 
 
 def shorten(text, limit=155):
@@ -1137,7 +1320,8 @@ def pool_load(root, now, force=False):
     try:
         d = _read_json(p)
         built = datetime.strptime(d["built"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        if not force and now - built < timedelta(days=POOL_TTL_DAYS) and any(d.get("groups", {}).values()):
+        if not force and d.get("v") == POOL_VERSION and now - built < timedelta(days=POOL_TTL_DAYS) \
+                and any(d.get("groups", {}).values()):
             return d
     except (OSError, ValueError, KeyError):
         pass
@@ -1160,12 +1344,35 @@ def select(pool, known_titles, skips, cap):
     return out
 
 
+def purge_invalid(root, arts, skips, log):
+    """Eski/uygunsuz kayıtları RSS'ten ve kayıttan çıkarır: başlığında ':' olan yardımcı sayfalar ve doğrulanmamış
+    (v1) il/ilçe makaleleri (bunlar yeni kurallarla yeniden doğrulanıp gerekirse aynı kimlikle yeniden üretilir)."""
+    keep, gone = [], 0
+    for a in arts:
+        colon = ":" in a.get("wiki_title", "")
+        stale = a.get("v", 1) < BUILD_VERSION and a.get("group") in ("il", "ilce")
+        if not (colon or stale):
+            keep.append(a)
+            continue
+        gone += 1
+        if colon:
+            skips[a["wiki_title"]] = {"n": 99, "r": "gecersiz"}
+        try:
+            os.remove(os.path.join(root, a["content_file"]))
+        except OSError:
+            pass
+        log(f"- kayıttan çıkarıldı ({'yardımcı sayfa' if colon else 'yeniden doğrulanacak'}): {a.get('wiki_title')}")
+    arts[:] = keep
+    return gone
+
+
 def run(root=None, api=None, now=None, limit=None, force_pool=False, log=print):
     root = root or SITE_ROOT
     now = (now or datetime.now(timezone.utc)).replace(microsecond=0)
     api = api or Api()
     data = store_load(root, log)
     arts, skips = data["articles"], data["skips"]
+    purge_invalid(root, arts, skips, log)
     known_ids = {a["pageid"] for a in arts}
     known_titles = {a["wiki_title"].casefold() for a in arts} | {a["title"].casefold() for a in arts}
 
@@ -1174,7 +1381,7 @@ def run(root=None, api=None, now=None, limit=None, force_pool=False, log=print):
     if pool is None:
         try:
             groups, report = discover(api, log)
-            pool = {"built": now.strftime("%Y-%m-%d"), "groups": groups, "report": report}
+            pool = {"v": POOL_VERSION, "built": now.strftime("%Y-%m-%d"), "groups": groups, "report": report}
             if any(groups.values()):
                 write_text(_path(root, "pool.json"), json.dumps(pool, ensure_ascii=False))
         except WikiError as e:
@@ -1206,7 +1413,7 @@ def run(root=None, api=None, now=None, limit=None, force_pool=False, log=print):
             continue
         streak = 0
         if rec is None:
-            skips[title] = {"n": 99 if extra == "anlam_ayrimi" else skips.get(title, {}).get("n", 0) + 1, "r": extra}
+            skips[title] = {"n": 99 if extra in ("anlam_ayrimi", "yer_degil") else skips.get(title, {}).get("n", 0) + 1, "r": extra}
             log(f"- atlandı ({extra}): {title}")
             continue
         if rec["pageid"] in known_ids:
@@ -1243,7 +1450,7 @@ def kontrol(api=None, log=print):
     for k, r in report.items():
         log(f"[{k}] {r['etiket']}: toplam aday {r['toplam']}")
         for f in r["bulunan"]:
-            log(f"    ✓ Kategori:{f['kategori']} -> {f['madde']} madde")
+            log(f"    ✓ {('Kategori:' + f['kategori']) if 'kategori' in f else f['kaynak']} -> {f['madde']} madde")
         for n in r["not"]:
             log(f"    ! {n}")
         if r["örnek"]:
