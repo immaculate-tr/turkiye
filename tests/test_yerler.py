@@ -235,13 +235,23 @@ class TestSanitize(unittest.TestCase):
         self.assertEqual([b[1] for b in self.blocks if b[0] == "h"], [2, 3, 2, 2, 2])
 
     def test_links_and_inline(self):
-        self.assertIn('<a href="https://tr.wikipedia.org/wiki/Antakya">Antakya</a>', self.text)
-        self.assertIn("Kırmızı", self.text)
+        self.assertIn("Antakya, Kırmızı ve dış bağlantı", self.text)            # metin kalır, bağlantı kalkar
+        self.assertNotIn("<a ", self.text)
         self.assertNotIn("redlink", self.text)
-        self.assertIn('href="https://example.org/x?a=1&amp;b=2" rel="nofollow noopener" target="_blank"', self.text)
         self.assertIn("<b>Hatay</b>", self.text)
         self.assertNotIn("<img", self.text)
         self.assertNotIn("class=", self.text)
+
+    def test_links_kept_when_enabled(self):
+        old = y.KEEP_LINKS
+        y.KEEP_LINKS = True
+        try:
+            blocks, _, _ = y.sanitize(SAMPLE, "Hatay")
+        finally:
+            y.KEEP_LINKS = old
+        text = " ".join(b[1] for b in blocks if b[0] == "html")
+        self.assertIn('<a href="https://tr.wikipedia.org/wiki/Antakya">Antakya</a>', text)
+        self.assertIn('rel="nofollow noopener" target="_blank"', text)
 
     def test_infobox(self):
         d = {k: v for k, v in self.rows if k}
@@ -256,9 +266,9 @@ class TestSanitize(unittest.TestCase):
 
     def test_tables_lists(self):
         self.assertIn("<table", self.text)
-        self.assertIn("<caption>Nüfus gelişimi</caption>", self.text)
+        self.assertIn("Nüfus gelişimi</caption>", self.text)
         self.assertIn("1.659.320", self.text)
-        self.assertIn("<li>Humus<ul><li>Hatay usulü</li></ul></li>", self.text)
+        self.assertRegex(self.text, r"<li>Humus<ul[^>]*><li>Hatay usulü</li></ul></li>")
         self.assertIn("overflow-x: auto", self.text)
 
     def test_figure_units(self):
@@ -267,7 +277,7 @@ class TestSanitize(unittest.TestCase):
         self.assertEqual(names, ["Sveti Petar.jpg", "Eski harita.jpg", "Fair use logo.png", "Kucuk ikon.png", "Galeri 1.jpg",
                                  "Galeri 2.jpg", "Cok 1.jpg", "Cok 2.jpg", "Plaj.jpg"])
         caps = dict(figs)
-        self.assertIn(">Kilisesi</a>", caps["Sveti Petar.jpg"])
+        self.assertEqual(caps["Sveti Petar.jpg"], "Aziz Petrus Kilisesi")
         self.assertEqual(caps["Eski harita.jpg"], "Eski harita")          # magnify temizlendi
         self.assertEqual(caps["Galeri 1.jpg"], "Künefe")
         self.assertEqual((caps["Cok 1.jpg"], caps["Cok 2.jpg"]), ("Birinci", "İkinci"))
@@ -310,8 +320,9 @@ class TestArticle(Base):
         self.assertEqual((rec["id"], rec["pageid"], rec["group"]), ("yer-4242", 4242, "il"))
         self.assertEqual(rec["link"], "https://tr.wikipedia.org/wiki/Hatay")
         self.assertEqual(rec["categories"], ["Türkiye'nin İlleri", "Hatay", "Türkiye"])
-        self.assertEqual(rec["title"], "Hatay İli: Tarih, Nüfus ve Mutfak")                # yalnızca gerçekten var olan bölümler
-        self.assertTrue(body.lstrip().startswith("<figure"))                       # kapak = bilgi kutusu görseli
+        self.assertEqual(rec["title"], "Hatay: Tarih, Nüfus ve Mutfak")                    # yalnızca gerçekten var olan bölümler; "İli" eki yok
+        self.assertTrue(body.lstrip().startswith('<div style="max-width: 100%'))         # tüm makale taşmayan bir sarmalayıcıda
+        self.assertLess(body.index("<figure"), body.index("Türkiye'nin güneyinde"))   # kapak = bilgi kutusu görseli, girişten önce
         self.assertIn("Hatay panorama.jpg".replace(" ", "_"), body)
         self.assertIn("1280px-Hatay_panorama.jpg", body)                           # yüksek çözünürlük (thumb 1280)
         self.assertEqual(rec["image"]["width"], 1280)
@@ -326,9 +337,10 @@ class TestArticle(Base):
         order = [body.index(x) for x in ("<figure", "Türkiye'nin güneyinde", "Hatay Künyesi</h2>", "Tarihçe</h2>",
                                            "Roma dönemi</h3>", "Nüfus</h2>", "Mutfak</h2>", "Kullanılan".replace("K", "k"))]
         self.assertEqual(order, sorted(order))
-        self.assertIn("<b>Nüfus:</b> 1.544.640", body)
-        self.assertIn("<b>— Yönetim —</b>", body)
-        self.assertNotIn("<b>— Hatay —</b>", body)
+        self.assertRegex(body, r"Nüfus</th><td[^>]*>1\.544\.640</td>")                  # künye tablosu (taşmaz)
+        self.assertIn("table-layout: fixed", body)
+        self.assertRegex(body, r">Yönetim</th></tr>")
+        self.assertNotRegex(body, r">Hatay</th></tr>")
         self.assertIn("36.20000, 36.16000", body)
         self.assertIn("openstreetmap.org", body)
         self.assertNotIn("Boş bölüm", body)                                         # boş başlık ayıklandı
@@ -467,9 +479,9 @@ class TestPipeline(Base):
         root, items = self.items()
         self.assertEqual({i.find("guid").text for i in items}, {"yer-1", "yer-2"})
         it = next(i for i in items if i.find("link").text == "https://tr.wikipedia.org/wiki/Hatay")
-        self.assertEqual(it.find("title").text, "Hatay İli: Tarih, Nüfus ve Mutfak")
+        self.assertEqual(it.find("title").text, "Hatay: Tarih, Nüfus ve Mutfak")
         enc = it.find("c:encoded", NS).text
-        self.assertIn("<h2>Tarihçe</h2>", enc)
+        self.assertRegex(enc, r"<h2[^>]*>Tarihçe</h2>")
         self.assertTrue(it.find("m:content", NS).attrib["url"].startswith("https://upload.wikimedia.org/"))
         self.assertIn("CC BY-SA 4.0", root.find("channel/copyright").text)
         idx = read_json(os.path.join(self.root, "data", "index.json"))
@@ -603,9 +615,9 @@ class TestMainArticles(Base):
     def test_follows_main_articles_in_place(self):
         (rec, body), fake = self.build()
         self.assertEqual(self.parsed_titles(fake), ["Hatay", "Hatay tarihi", "Hatay mutfağı", "Belirsiz", "Kısa madde"])
-        order = [body.index(x) for x in ("<h2>Tarih</h2>", "Tarih bölümü özeti", "Antik çağ metni", "<h3>Hatay tarihi</h3>",
-                                           "Ayrıntılı madde: ", "Hatay tarihi giriş metni", "<h4>Antik dönem</h4>", "<h2>Mutfak</h2>",
-                                           "Mutfak metni", "<h3>Hatay mutfağı</h3>", "<h4>Tatlılar</h4>", "<h2>Kültür</h2>")]
+        order = [body.index(x) for x in (">Tarih</h2>", "Tarih bölümü özeti", "Antik çağ metni", ">Hatay tarihi</h3>",
+                                           "Ayrıntılı madde: ", "Hatay tarihi giriş metni", ">Antik dönem</h4>", ">Mutfak</h2>",
+                                           "Mutfak metni", ">Hatay mutfağı</h3>", ">Tatlılar</h4>", ">Kültür</h2>")]
         self.assertEqual(order, sorted(order))
         self.assertEqual(body.count("Hatay tarihi giriş metni"), 1)                       # tekrarlanan bağlantı bir kez
         for bad in ("Gizli kaynak", "İç içe madde", "Kırmızı", "Liste Yok"):
@@ -648,7 +660,7 @@ class TestMainArticles(Base):
         api = y.Api(transport=transport, sleep=lambda s: None, min_interval=0)
         rec, body = y.build_article(api, "Hatay", "il", NOW)
         self.assertEqual(rec["subs"], 1)
-        self.assertNotIn("<h3>Hatay mutfağı</h3>", body)
+        self.assertNotIn(">Hatay mutfağı</h3>", body)
 
 
 class TestTitlesAndTransport(Base):
@@ -657,14 +669,14 @@ class TestTitlesAndTransport(Base):
         full = ["Tarihçe", "Coğrafya", "İklim", "Nüfus", "Ekonomi", "Kültür", "Mutfak", "Gezilecek yerler", "Belediye"]
         t = y.feed_title("il", "Hatay", [], full)
         self.assertLessEqual(len(t), y.TITLE_LIMIT)                                         # arama sonucunda kesilmez
-        self.assertTrue(t.startswith("Hatay İli: Tarih, "))
+        self.assertTrue(t.startswith("Hatay: Tarih, "))
         self.assertIn("Nüfus", t)
-        self.assertEqual(y.feed_title("il", "Van", [], ["Tarihçe", "Nüfus"]), "Van İli: Tarih ve Nüfus")
+        self.assertEqual(y.feed_title("il", "Van", [], ["Tarihçe", "Nüfus"]), "Van: Tarih ve Nüfus")
         self.assertEqual(y.feed_title("ilce", "Antakya", [("İl", "Hatay")], ["Tarih", "Nüfus", "Mutfak"]),
-                         "Antakya (Hatay) İlçesi: Tarih, Nüfus ve Mutfak")
-        self.assertEqual(y.feed_title("ilce", "Defne", [], ["Coğrafya"]), "Defne İlçesi: Coğrafya ve Genel Bilgiler")
-        self.assertEqual(y.feed_title("ilce", "Kale", [], []), "Kale İlçesi: Genel Bilgiler")
-        self.assertEqual(y.feed_title("il", "Hatay (il)", [], ["Tarih", "Coğrafya"]), "Hatay İli: Tarih ve Coğrafya")
+                         "Antakya (Hatay): Tarih, Nüfus ve Mutfak")
+        self.assertEqual(y.feed_title("ilce", "Defne", [], ["Coğrafya"]), "Defne: Coğrafya ve Genel Bilgiler")
+        self.assertEqual(y.feed_title("ilce", "Kale", [], []), "Kale: Genel Bilgiler")
+        self.assertEqual(y.feed_title("il", "Hatay (il)", [], ["Tarih", "Coğrafya"]), "Hatay: Tarih ve Coğrafya")
         self.assertEqual(y.feed_title("harikalar", "Petra", [], ["Tarih", "Mimari yapı", "Ziyaret"]), "Petra: Tarihçe, Mimari ve Ziyaret Bilgileri")
         self.assertEqual(y.feed_title("harikalar", "Petra", [], []), "Petra Hakkında Genel Bilgiler")
         self.assertEqual(y.tr_lower("İzmir ILIK"), "izmir ılık")
@@ -854,3 +866,117 @@ class TestClientAndMain(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ----------------------------------------------------------------------------- premium düzen
+INFOBOX_SECTIONS = """<div class="mw-parser-output">
+<table class="infobox geography vcard"><tbody>
+<tr><th colspan="2" class="infobox-above">Adapazarı</th></tr>
+<tr><th scope="row">İl</th><td>Sakarya ili</td></tr>
+<tr><th colspan="2">Yönetim</th></tr>
+<tr><th scope="row">• Belediye başkanı</th><td>Ali Veli (Parti)</td></tr>
+<tr><th scope="row">• Kaymakam</th><td>Ayşe Yılmaz</td></tr>
+<tr><th colspan="2">Yüzölçümü</th></tr>
+<tr><th scope="row">• Toplam</th><td>1.234 km<sup>2</sup></td></tr>
+<tr><th colspan="2">Nüfus (2023)</th></tr>
+<tr><th scope="row">• Toplam</th><td>290.000</td></tr>
+<tr><th scope="row">• Yoğunluk</th><td>235/km2</td></tr>
+<tr><th scope="row">Rakım</th><td>31 m</td></tr>
+<tr><th scope="row">Plaka kodu</th><td>54</td></tr>
+<tr><th scope="row">Alan kodu</th><td>0264</td></tr>
+<tr><th scope="row">Posta kodu</th><td>54100</td></tr>
+</tbody></table>
+<p>Adapazarı, Sakarya ilinin merkez ilçesidir. """ + LONG + """</p>
+<div class="mw-heading mw-heading2"><h2>Tarihçe</h2></div><p>""" + LONG + """</p>
+<div class="mw-heading mw-heading2"><h2>Coğrafya</h2></div><p>""" + LONG + """</p>
+<div class="mw-heading mw-heading2"><h2>Nüfus</h2></div><p>""" + LONG + """</p>
+<div class="mw-heading mw-heading2"><h2>Kültür</h2></div><p>""" + LONG + """</p>
+<div class="mw-heading mw-heading2"><h2>Mutfak</h2></div><p>""" + LONG + """</p>
+</div>"""
+
+
+class TestPremiumLayout(Base):
+    def article(self, group="ilce", title="Adapazarı"):
+        fake = FakeWiki(pages={title: page(title, 54, text=INFOBOX_SECTIONS)}, coords={title: (40.78, 30.4)})
+        return y.build_article(api_for(fake), title, group, NOW), fake
+
+    def test_title_has_no_il_or_ilce_suffix(self):
+        (rec, body), _ = self.article()
+        self.assertEqual(rec["title"], "Adapazarı (Sakarya): Tarih, Coğrafya, Nüfus, Kültür ve Mutfak")
+        self.assertNotIn("İlçesi", rec["title"])
+        self.assertNotIn("İli", rec["title"])
+        self.assertLessEqual(len(rec["title"]), y.TITLE_LIMIT)
+
+    def test_title_caps_topics_and_keeps_tourism(self):
+        full = ["Tarihçe", "Coğrafya", "Nüfus", "Ekonomi", "Kültür", "Mutfak", "Gezilecek yerler", "Belediye"]
+        t = y.feed_title("il", "Kahramanmaraş", [], full)
+        self.assertLessEqual(len(t), y.TITLE_LIMIT)
+        self.assertLessEqual(t.split(": ", 1)[1].count(",") + 1, 4)               # en çok 5 konu ("... ve ...")
+        self.assertIn("Gezilecek Yerler", t)
+        self.assertNotIn("Yönetim", t)
+        self.assertEqual(y.feed_title("ilce", "Kale", [("İl", "Denizli ili")], ["Tarih"]), "Kale (Denizli): Tarih ve Genel Bilgiler")
+
+    def test_key_facts_from_sectioned_infobox(self):
+        rows = [(None, "Yönetim"), ("• Belediye başkanı", "Ali Veli (Parti)"), (None, "Yüzölçümü"), ("• Toplam", "1.234 km2"),
+                (None, "Nüfus (2023)"), ("• Toplam", "290.000"), ("• Yoğunluk", "235/km2"), ("Plaka kodu", "54"),
+                ("Alan kodu", "0264"), ("Rakım", "31 m")]
+        d = dict(y.key_facts(rows))
+        self.assertEqual(d["Nüfus (2023)"], "290.000")                              # bölüm başlığı + "Toplam" satırı
+        self.assertEqual(d["Yüzölçümü"], "1.234 km2")
+        self.assertEqual((d["Plaka Kodu"], d["Alan Kodu"], d["Rakım"]), ("54", "0264", "31 m"))
+        self.assertEqual(d["Belediye Başkanı"], "Ali Veli (Parti)")
+        self.assertNotIn("Yoğunluk", " ".join(d))
+        self.assertEqual(y.key_facts([("Başka", "x")]), [])                          # olmayan bilgi uydurulmaz
+
+    def test_tiles_infobox_toc_faq_present(self):
+        (rec, body), _ = self.article()
+        for label, val in (("Nüfus (2023)", "290.000"), ("Yüzölçümü", "1.234"), ("Plaka Kodu", "54"), ("Belediye Başkanı", "Ali Veli")):
+            self.assertRegex(body, re.escape(label) + r"</div><div[^>]*>" + re.escape(val))
+        self.assertIn("İçindekiler", body)
+        self.assertIn('href="#b-tarihce"', body)
+        self.assertIn('id="b-tarihce"', body)
+        self.assertIn("Sık Sorulan Sorular", body)
+        self.assertIn("Adapazarı nüfusu ne kadar?", body)
+        self.assertIn("Adapazarı hangi ile bağlı?", body)
+        self.assertIn("Sakarya iline bağlıdır", body)
+        self.assertLess(body.index("İçindekiler"), body.index("Adapazarı Künyesi</h2>"))
+
+    def test_no_faq_or_tiles_without_infobox_facts(self):
+        fake = FakeWiki(pages={"Petra": page("Petra", 9, text=SAMPLE.replace("Hatay", "Petra"))}, coords={"Petra": (30.3, 35.4)})
+        rec, body = y.build_article(api_for(fake), "Petra", "harikalar", NOW)
+        self.assertNotIn("Sık Sorulan Sorular", body)                                # yalnızca il/ilçe
+
+    def test_overflow_protection(self):
+        (rec, body), _ = self.article()
+        self.assertIn("overflow-wrap: anywhere", body)
+        self.assertIn("table-layout: fixed", body)
+        self.assertIn("max-width: 100%", body)
+        self.assertNotIn("<br />", body.split("Künyesi</h2>")[1].split("</table>")[0])   # künye eski satır-satır düzende değil
+
+    def test_wide_table_scrolls_instead_of_squeezing(self):
+        wide = "<table class='wikitable'>" + "<tr>" + "".join(f"<th>S{i}</th>" for i in range(7)) + "</tr>" \
+               + "<tr>" + "".join(f"<td>{i}</td>" for i in range(7)) + "</tr></table>"
+        blocks, _, _ = y.sanitize(f"<div class='mw-parser-output'>{wide}</div>", "X")
+        html_ = blocks[0][1]
+        self.assertIn("overflow-x: auto", html_)
+        self.assertIn("min-width: 770px", html_)
+
+    def test_lead_image_requests_high_resolution(self):
+        fake = FakeWiki(pages={"Hatay": page("Hatay", 4242)}, coords={"Hatay": (36.2, 36.16)})   # görselli örnek madde
+        rec, body = y.build_article(api_for(fake), "Hatay", "il", NOW)
+        widths = [p["iiurlwidth"] for p in fake.log if p.get("prop") == "imageinfo"]
+        self.assertIn(str(y.LEAD_WIDTH), widths)                                     # kapak için 1920 px istenir
+        self.assertIn(str(y.IMG_WIDTH), widths)                                      # diğerleri 1280 px
+        self.assertIn('loading="eager"', body)                                       # kapak görseli geç yüklenmez
+
+    def test_alt_text_and_slug(self):
+        self.assertEqual(y.alt_text("Hatay (il)", ""), "Hatay görseli")
+        self.assertEqual(y.alt_text("Hatay", "Antakya Ulu Camii"), "Hatay – Antakya Ulu Camii")
+        self.assertEqual(y.alt_text("Hatay", "Hatay'dan bir görünüm"), "Hatay'dan bir görünüm")
+        self.assertEqual(y.slugify("Çiğ Köfte & Şalgam İçeceği"), "cig-kofte-salgam-icecegi")
+        self.assertEqual(y.slugify("???"), "bolum")
+
+    def test_license_note_kept(self):
+        (rec, body), _ = self.article()
+        self.assertIn("Creative Commons Atıf-AynıLisanslaPaylaş 4.0", body)
+        self.assertTrue(body.rstrip().endswith("</div>"))
