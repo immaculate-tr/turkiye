@@ -31,12 +31,19 @@ maddelerini de içerir. Her makalede en çok 6 ayrıntılı madde eklenir, iç i
 makalenin lisans notunda listelenir. Kapatmak için `FOLLOW_MAIN: "0"`.
 
 ## SEO
-* **Konu başlığı** şablon cümle değil, makalenin gerçekten içerdiği bölümlerden üretilir ve yaklaşık 68 karakteri geçmez:
-  örneğin `Hatay İli: Tarih, Nüfus ve Mutfak`, `Antakya (Hatay) İlçesi: Tarih, Coğrafya ve Nüfus`.
+* **Konu başlığı** kısa ve temizdir: "İli / İlçesi" eki yoktur, en çok 5 konu içerir ve yaklaşık 68 karakteri geçmez.
+  Konular şablon değil, makalenin gerçekten içerdiği bölümlerden üretilir; örneğin
+  `Hatay: Tarih, Coğrafya, Nüfus, Kültür ve Mutfak`, `Adapazarı (Sakarya): Tarih, Coğrafya, Nüfus, Kültür ve Mutfak`.
+  Başlık uzarsa önce Yönetim, Ekonomi, Coğrafya atılır; "Gezilecek Yerler" en son atılır. Ayraç `TITLE_SEP` ile değiştirilir.
   Maddede olmayan konu başlığa yazılmaz.
 * **Açıklama** (`description`): giriş paragrafından, parantez içi okunuş/yazılış çıkarılarak, mümkünse cümle sonunda biten
   en çok 155 karakterlik meta açıklamadır.
 * **Etiketler**: `Türkiye'nin İlleri`, il/ilçe adı, `Türkiye` gibi konuya özgü etiketler (Blogger etiketi olur).
+* **Bağlantılar:** Makale metnindeki Vikipedi ve dış bağlantılar kaldırılır (metin kalır). Yalnızca görsel yazar/lisans satırı ve makale sonundaki kaynak/lisans notu bağlantı içerir. Eski davranış için `KEEP_LINKS: "1"`.
+* **Premium düzen (Blogger uyumlu, yalnızca satır içi stil):** kapak görseli 1920 px; Nüfus, Yüzölçümü, Rakım, Plaka/Alan/Posta
+  kodu, Belediye Başkanı, Kaymakam/Vali kutuları (yalnızca künyede varsa); sabit düzenli künye tablosu; İçindekiler;
+  künyedeki gerçek değerlerden **Sık Sorulan Sorular** (il/ilçe). Uzun kelime/adres, geniş tablo ve görseller taşmaz:
+  5+ sütunlu tablolar sıkışmak yerine kendi içinde yatay kaydırılır.
 * Görsellerin `alt` metni ad + açıklamadan oluşur; her görselin altında yazar ve lisans vardır. Sayfada tek H1 yoktur
   (Blogger başlığı H1 yapar); bölümler H2–H4 olarak sıralanır.
 
@@ -50,10 +57,15 @@ makalenin lisans notunda listelenir. Kapatmak için `FOLLOW_MAIN: "0"`.
 
 ## Ayarlar (workflow `env:`)
 `PER_RUN` (10), `FEED_ITEMS` (100), `FEED_MAX_MB` (25), `MAX_IMAGES` (80), `MIN_TEXT_CHARS` (1500), `MIN_IMG_W` (400),
-`POOL_TTL_DAYS` (7), `CONTENT_KEEP_DAYS` (30), `FOLLOW_MAIN` (1), `MAX_SUB` (6), `SUB_MAX_CHARS` (80000),
+`LEAD_WIDTH` (1920), `POOL_TTL_DAYS` (7), `CONTENT_KEEP_DAYS` (30), `FOLLOW_MAIN` (1), `MAX_SUB` (6), `SUB_MAX_CHARS` (80000),
 `TOTAL_MAX_CHARS` (500000), `CATS_<GRUP>`.
 
 ## Bilinmesi gerekenler
 * Metinler Vikipedi'de ne yazıyorsa odur. Belediye başkanı ve partisi gibi bilgiler maddede varsa gelir; güncel olmayabilir
   (kullanılan sürüm bağlantısı her makalenin sonundadır).
 * Çok kısa (taslak) ilçe maddeleri atlanır (`MIN_TEXT_CHARS`).
+
+## Sürüm notu (BUILD_VERSION 3)
+Yeni başlık biçimi ve düzen yalnızca **yeni üretilen** makalelere uygulanır. Eski sürümle üretilmiş il/ilçe makaleleri ilk
+çalışmada kayıttan çıkarılır ve yeni biçimde, aynı kimlikle yeniden üretilir (her çalışmada `PER_RUN` kadar). Blogger'a
+önceden aktarılmış yazılar RSS'ten otomatik güncellenmez; gerekirse bu yazıları Blogger'da silip yeniden içe aktarın.

@@ -65,17 +65,21 @@ FEED_MAX_MB = _int("FEED_MAX_MB", 25)            # rss.xml üst boyutu (aşılı
 MIN_TEXT_CHARS = _int("MIN_TEXT_CHARS", 1500)    # bundan kısa madde = taslak, atlanır (sonra yeniden denenir)
 MAX_IMAGES = _int("MAX_IMAGES", 80)              # makale başına en çok görsel
 IMG_WIDTH = _int("IMG_WIDTH", 1280)              # görsel genişliği (Wikimedia'nın izin verdiği basamak)
+LEAD_WIDTH = _int("LEAD_WIDTH", 1920)            # kapak görseli genişliği (Wikimedia basamağı: 1920)
 MIN_IMG_W = _int("MIN_IMG_W", 400)               # bundan dar görseller (ikon, bayrak) alınmaz
 POOL_TTL_DAYS = _int("POOL_TTL_DAYS", 7)
 MAX_SKIP_ATTEMPTS = _int("MAX_SKIP_ATTEMPTS", 6)
 CONTENT_KEEP_DAYS = _int("CONTENT_KEEP_DAYS", 30)
 MAX_TABLE_ROWS = _int("MAX_TABLE_ROWS", 400)
+KEEP_LINKS = (os.environ.get("KEEP_LINKS") or "0").strip().lower() in ("1", "true", "evet", "yes")   # 1 = metin içi bağlantıları koru
 FOLLOW_MAIN = (os.environ.get("FOLLOW_MAIN") or "1").strip().lower() not in ("0", "false", "hayır", "hayir", "no")
 MAX_SUB = _int("MAX_SUB", 6)                     # makale başına en çok "Ana madde" ile bağlı ayrıntılı madde
 SUB_MIN_CHARS = _int("SUB_MIN_CHARS", 600)       # bundan kısa ayrıntılı maddeler eklenmez
 SUB_MAX_CHARS = _int("SUB_MAX_CHARS", 80000)     # tek ayrıntılı maddeden en çok metin (bölüm sınırında kesilir)
 TOTAL_MAX_CHARS = _int("TOTAL_MAX_CHARS", 500000)  # makalenin toplam metin sınırı (aşılınca yeni ayrıntılı madde eklenmez)
-BUILD_VERSION = 2          # 2: il/ilçe listesi Wikidata'dan, yer doğrulaması eklendi
+BUILD_VERSION = 3          # 3: premium düzen, yeni başlık biçimi (il/ilçe makaleleri yeniden üretilir)
+ACCENT = "#c8102e"         # başlık/kutu vurgu rengi
+TITLE_SEP = ": "           # "Adapazarı (Sakarya): Tarih, ..." ayracı
 POOL_VERSION = 2
 SPARQL_URL = "https://query.wikidata.org/sparql"
 IL_NAMES = [
@@ -301,14 +305,14 @@ class Api:
         c = (pg.get("coordinates") or [None])[0]
         return (c["lat"], c["lon"]) if c and "lat" in c and "lon" in c else None
 
-    def image_info(self, names):
-        """dosya adları -> {anahtar: bilgi}; anahtar = fkey(ad)."""
+    def image_info(self, names, width=None):
+        """dosya adları -> {anahtar: bilgi}; anahtar = fkey(ad). width: istenen küçük resim genişliği."""
         out = {}
         names = list(dict.fromkeys(names))
         for i in range(0, len(names), 40):
             batch = names[i:i + 40]
             data = self.request({"action": "query", "prop": "imageinfo", "titles": "|".join("Dosya:" + n for n in batch),
-                                 "iiprop": "url|size|mime", "iiurlwidth": str(IMG_WIDTH), "redirects": "1",
+                                 "iiprop": "url|size|mime", "iiurlwidth": str(width or IMG_WIDTH), "redirects": "1",
                                  "iiextmetadatafilter": "Artist|Credit|LicenseShortName|LicenseUrl|NonFree|Copyrighted|UsageTerms",
                                  "iiextmetadatalanguage": WIKI})
             q = data.get("query", {})
@@ -496,6 +500,8 @@ def inline(node):
             return inner
         if "redlink=1" in href:
             return inner
+        if not KEEP_LINKS:                                   # metin içi bağlantılar kaldırılır, yalnızca metin kalır
+            return inner
         url = abs_url(href)
         if url.startswith(WIKI_HOST + "/wiki/") or url.startswith(WIKI_HOST + "/w/index.php"):
             return f'<a href="{esc(url)}">{inner}</a>' if inner.strip() else ""
@@ -616,11 +622,17 @@ def list_html(tag):
         body = "".join(parts).strip()
         if re.sub(r"<[^>]+>|\s|&nbsp;", "", body):
             items.append(f"<{li.name}>{body}</{li.name}>")
-    return f"<{name}>{''.join(items)}</{name}>" if items else ""
+    style = "margin: 0.8em 0; padding-left: 1.5em; line-height: 1.7;" if name != "dl" else "margin: 0.8em 0;"
+    return f'<{name} style="{style}">{"".join(items)}</{name}>' if items else ""
+
+
+TD_STYLE = ("border: 1px solid #e5e7eb; padding: 8px 10px; vertical-align: top; font-size: 14px; line-height: 1.5; "
+            "color: #1f2937; overflow-wrap: anywhere; word-break: break-word;")
+TH_STYLE = TD_STYLE + " background: #f3f4f6; font-weight: 700; text-align: left;"
 
 
 def table_html(tag):
-    rows = []
+    rows, widest = [], 0
     for tr in tag.find_all("tr")[:MAX_TABLE_ROWS]:
         if is_noise(tr) or tr.find_parent("table") is not tag:
             continue
@@ -634,17 +646,20 @@ def table_html(tag):
                 v = (c.get(a) or "").strip()
                 if v.isdigit() and 1 < int(v) <= 50:
                     attrs += f' {a}="{int(v)}"'
-            style = "border: 1px solid #ccc; padding: 4px 8px; vertical-align: top;"
-            if c.name == "th":
-                style += " background: #f2f2f2; font-weight: bold;"
+            zebra = "" if c.name == "th" or len(rows) % 2 == 0 else " background: #f9fafb;"
+            style = (TH_STYLE if c.name == "th" else TD_STYLE + (zebra or " background: #ffffff;"))
             cells.append(f'<{c.name}{attrs} style="{style}">{body}</{c.name}>')
         if cells:
+            widest = max(widest, len(cells))
             rows.append("<tr>" + "".join(cells) + "</tr>")
     if not rows or not re.sub(r"<[^>]+>|\s|&nbsp;", "", "".join(rows)):
         return ""
     cap = tag.find("caption")
-    cap_html = f"<caption>{inline(cap).strip()}</caption>" if cap is not None and inline(cap).strip() else ""
-    return ('<div style="overflow-x: auto;"><table style="border-collapse: collapse; width: 100%; margin: 1em 0;">'
+    cap_html = (f'<caption style="caption-side: top; text-align: left; font-weight: 700; padding: 6px 2px;">'
+                f"{inline(cap).strip()}</caption>") if cap is not None and inline(cap).strip() else ""
+    minw = f" min-width: {min(900, 110 * widest)}px;" if widest >= 5 else ""         # çok sütunlu tablo sıkışmasın, kaydırılsın
+    return ('<div style="overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; margin: 1.3em 0;">'
+            f'<table style="border-collapse: collapse; width: 100%;{minw}">'
             f'{cap_html}{"".join(rows)}</table></div>')
 
 
@@ -761,7 +776,8 @@ def sanitize(parse_html, title):
         if name == "blockquote":
             body = inline(el).strip()
             if body:
-                blocks.append(("html", f"<blockquote>{body}</blockquote>"))
+                blocks.append(("html", f'<blockquote style="margin: 1.2em 0; padding: 0.6em 1.1em; border-left: 4px solid {ACCENT}; '
+                                    f'background: rgba(128,128,128,.10);">{body}</blockquote>'))
             return
         if name == "table":
             if el.find("img") and not el.find(class_="wikitable") and "wikitable" not in cls and len(plain(el)) < 400:
@@ -832,16 +848,28 @@ def lead_ok(name, info):
     return not _NOT_LEAD.search(name) and info.get("mime") != "image/svg+xml" and 0.5 <= w / max(h, 1) <= 2.5
 
 
-def figure_html(name, cap_html, info, alt):
+def alt_text(place, cap_html):
+    """Görsel alt metni: yer adı + açıklama (adı zaten geçiyorsa tekrarlanmaz)."""
+    cap, place = strip_tags(cap_html), display_name(place)
+    if not cap:
+        return f"{place} görseli"
+    return (cap if tr_lower(place) in tr_lower(cap) else f"{place} – {cap}")[:200]
+
+
+def figure_html(name, cap_html, info, alt, lead=False):
     url = info.get("thumburl") or info.get("url")
     w = info.get("thumbwidth") or info.get("width")
     h = info.get("thumbheight") or info.get("height")
     dims = f' width="{int(w)}" height="{int(h)}"' if w and h else ""
     cap = (cap_html + "<br />" if cap_html else "") + credit_html(info)
-    return ('<figure style="margin: 1em 0; text-align: center;">'
+    load = 'loading="eager" fetchpriority="high"' if lead else 'loading="lazy"'
+    return (f'<figure style="margin: {"0 0 1.4em" if lead else "1.7em 0"}; padding: 0; text-align: center; max-width: 100%;">'
             f'<a href="{esc(info.get("url") or url)}" rel="noopener" target="_blank">'
-            f'<img alt="{esc(alt)}" loading="lazy" src="{esc(url)}"{dims} style="max-width: 100%; height: auto;" /></a>'
-            f'<figcaption style="font-size: 90%;">{cap}</figcaption></figure>')
+            f'<img alt="{esc(alt)}" {load} decoding="async" src="{esc(url)}"{dims} '
+            'style="display: block; width: auto; max-width: 100%; height: auto; margin: 0 auto; border-radius: 12px; '
+            'box-shadow: 0 6px 24px rgba(0,0,0,.18);" /></a>'
+            '<figcaption style="font-size: 14px; line-height: 1.5; margin-top: 0.7em; opacity: .88; overflow-wrap: anywhere;">'
+            f'{cap}</figcaption></figure>')
 
 
 # ----------------------------------------------------------------------------- makale
@@ -877,7 +905,7 @@ _IL_TOPICS = [
     ("Gezilecek Yerler", r"gezilecek|görülecek|turizm|turistik|ören yeri|müze|ziyaret|doğal güzellik|plaj|kaplıca|yayla"),
     ("Yönetim", r"yönetim|belediye|seçim|idari"),
 ]
-_IL_DROP = ["Yönetim", "Ekonomi", "Gezilecek Yerler", "Mutfak", "Kültür", "Nüfus", "Coğrafya", "Tarih"]   # başlık uzarsa önce atılanlar
+_IL_DROP = ["Yönetim", "Ekonomi", "Coğrafya", "Mutfak", "Kültür", "Nüfus", "Tarih", "Gezilecek Yerler"]   # başlık uzarsa önce atılanlar
 _YER_TOPICS = [
     ("Tarihçe", r"\btarih"),
     ("Konum", r"konum|coğrafya|bulunduğu yer|iklim"),
@@ -894,14 +922,17 @@ def join_tr(items):
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " ve " + items[-1]
 
 
-def pick_topics(heads, rules, drop, base):
+def pick_topics(heads, rules, drop, base, cap=5):
+    """Makalede gerçekten bulunan konular; en çok `cap` konu ve TITLE_LIMIT karakter."""
     low = [tr_lower(h) for h in heads]
     topics = [name for name, rx in rules if any(re.search(rx, h) for h in low)]
-    while len(f"{base}: {join_tr(topics)}") > TITLE_LIMIT and len(topics) > 2:
+    while (len(topics) > cap or len(f"{base}{TITLE_SEP}{join_tr(topics)}") > TITLE_LIMIT) and len(topics) > 2:
         for d in drop:
             if d in topics:
                 topics.remove(d)
                 break
+        else:
+            break
     return topics
 
 
@@ -909,23 +940,29 @@ def row_value(rows, labels):
     return next((v for k, v in rows if k and tr_lower(k) in labels), "")
 
 
+def parent_il(rows):
+    il = row_value(rows, ("il", "ili", "bağlı olduğu il", "bulunduğu il"))
+    return re.sub(r"\s+ili$", "", collapse(il), flags=re.I).strip()
+
+
 def feed_title(group, name, rows, heads=()):
-    """Konu başlığı: makalenin gerçekten içerdiği bölümlerden (şablon cümle değil)."""
+    """Konu başlığı: \"Adapazarı (Sakarya): Tarih, Coğrafya, Nüfus, Kültür ve Mutfak\" (\"İli/İlçesi\" eki yok;
+    konular şablon değil, makalenin gerçekten içerdiği bölümlerden gelir)."""
     name = display_name(name)
     if group == "il":
-        base, rules, drop = f"{name} İli", _IL_TOPICS, _IL_DROP
+        base, rules, drop = name, _IL_TOPICS, _IL_DROP
     elif group == "ilce":
-        il = row_value(rows, ("il", "ili", "bağlı olduğu il", "bulunduğu il"))
-        base, rules, drop = (f"{name} ({il}) İlçesi" if il else f"{name} İlçesi"), _IL_TOPICS, _IL_DROP
+        il = parent_il(rows)
+        base, rules, drop = (f"{name} ({il})" if il else name), _IL_TOPICS, _IL_DROP
     else:
         base, rules, drop = name, _YER_TOPICS, _YER_DROP
     topics = pick_topics(heads, rules, drop, base)
     if len(topics) >= 2:
-        t = f"{base}: {join_tr(topics)}"
+        t = f"{base}{TITLE_SEP}{join_tr(topics)}"
     elif len(topics) == 1:
-        t = f"{base}: {topics[0]} ve Genel Bilgiler"
+        t = f"{base}{TITLE_SEP}{topics[0]} ve Genel Bilgiler"
     else:
-        t = f"{base}: Genel Bilgiler" if group in ("il", "ilce") else f"{base} Hakkında Genel Bilgiler"
+        t = f"{base}{TITLE_SEP}Genel Bilgiler" if group in ("il", "ilce") else f"{base} Hakkında Genel Bilgiler"
     return t if len(t) <= 120 else base
 
 
@@ -934,10 +971,174 @@ def feed_labels(group, label, name, rows):
     if group == "il":
         labels = [label, name, "Türkiye"]
     elif group == "ilce":
-        labels = [label, row_value(rows, ("il", "ili", "bağlı olduğu il", "bulunduğu il")), name, "Türkiye"]
+        labels = [label, parent_il(rows), name, "Türkiye"]
     else:
         labels = [label, name]
     return [l for l in dict.fromkeys(x for x in labels if x)][:5]
+
+
+# ----------------------------------------------------------------------------- premium düzen
+_TR_ASCII = str.maketrans("çğıöşüÇĞİÖŞÜâîûÂÎÛ", "cgiosuCGIOSUaiuAIU")
+WRAP_STYLE = ("max-width: 100%; box-sizing: border-box; overflow-wrap: anywhere; word-wrap: break-word; "
+              "line-height: 1.75; font-size: 17px;")
+CARD_STYLE = ("box-sizing: border-box; background: #ffffff; color: #1f2937; border: 1px solid #e5e7eb; "
+              "border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.08);")
+_HEAD_STYLES = {
+    2: f"margin: 2em 0 0.6em; padding: 0.15em 0 0.15em 0.6em; border-left: 5px solid {ACCENT}; "
+       "font-size: 1.55em; line-height: 1.3; color: inherit; overflow-wrap: anywhere;",
+    3: "margin: 1.6em 0 0.5em; font-size: 1.28em; line-height: 1.35; color: inherit; overflow-wrap: anywhere;",
+    4: "margin: 1.3em 0 0.4em; font-size: 1.12em; line-height: 1.4; color: inherit; overflow-wrap: anywhere;",
+}
+TOC_MARK = "<!--yr-toc-->"
+
+
+def slugify(text):
+    sl = re.sub(r"[^a-z0-9]+", "-", (text or "").translate(_TR_ASCII).lower()).strip("-")
+    return sl[:60] or "bolum"
+
+
+def heading_html(level, text, sid=None):
+    level = max(2, min(level, 4))
+    idattr = f' id="{esc(sid)}"' if sid else ""
+    return f'<h{level}{idattr} style="{_HEAD_STYLES[level]}">{esc(text)}</h{level}>'
+
+
+def _fact_label(label):
+    return tr_lower(label).lstrip("•·-–— ").strip()
+
+
+def key_facts(rows):
+    """Künye satırlarından öne çıkan bilgiler: [(etiket, değer)]. Yalnızca künyede olan değerler alınır."""
+    sec, sec_raw, found = "", "", {}
+
+    def put(key, label, val):
+        val = collapse(val)
+        if val and key not in found:
+            found[key] = (label, val if len(val) <= 60 else shorten(val, 60))
+
+    for label, val in rows:
+        if label is None:
+            sec, sec_raw = tr_lower(val), val
+            continue
+        low, raw = _fact_label(label), label.lstrip("•·-–— ").strip()
+        if low.startswith("nüfus"):
+            put("nufus", raw, val)
+        elif sec.startswith("nüfus") and low.startswith("toplam"):
+            put("nufus", sec_raw, val)
+        elif low.startswith("yüzölçüm"):
+            put("alan", "Yüzölçümü", val)
+        elif (sec.startswith("yüzölçüm") or (sec.startswith("alan") and not sec.startswith("alan kodu"))) \
+                and low.startswith("toplam"):
+            put("alan", "Yüzölçümü", val)
+        elif low.startswith("rakım") or low.startswith("yükseklik"):
+            put("rakim", "Rakım", val)
+        elif low.startswith("plaka"):
+            put("plaka", "Plaka Kodu", val)
+        elif low.startswith("alan kodu"):
+            put("alankodu", "Alan Kodu", val)
+        elif low.startswith("posta kodu"):
+            put("posta", "Posta Kodu", val)
+        elif "belediye başkanı" in low:
+            put("baskan", "Belediye Başkanı", val)
+        elif re.match(r"^(kaymakam)\b", low):
+            put("kaymakam", "Kaymakam", val)
+        elif re.match(r"^(vali)(si)?\b", low):
+            put("vali", "Vali", val)
+    order = ("nufus", "alan", "rakim", "plaka", "alankodu", "posta", "baskan", "kaymakam", "vali")
+    return [found[k] for k in order if k in found]
+
+
+def tiles_html(facts):
+    if not facts:
+        return ""
+    tiles = "".join(
+        f'<div style="display: inline-block; vertical-align: top; width: calc(33.333% - 14px); min-width: 150px; '
+        f'margin: 6px; padding: 14px 12px; border-top: 4px solid {ACCENT}; text-align: center; {CARD_STYLE}">'
+        f'<div style="font-size: 13px; color: #6b7280; line-height: 1.3;">{esc(l)}</div>'
+        f'<div style="font-size: 20px; font-weight: 700; line-height: 1.3; margin-top: 4px;">{esc(v)}</div></div>'
+        for l, v in facts)
+    return f'<div style="text-align: center; margin: 1.2em -6px;">{tiles}</div>'
+
+
+def infobox_html(name, rows, coords):
+    """Künye: sabit düzenli, taşmayan iki sütunlu kart tablo."""
+    th = ("border-bottom: 1px solid #e5e7eb; padding: 9px 12px; vertical-align: top; text-align: left; "
+          "font-size: 14px; line-height: 1.5; color: #374151; background: #f9fafb; font-weight: 700; "
+          "overflow-wrap: anywhere; word-break: break-word;")
+    td = ("border-bottom: 1px solid #e5e7eb; padding: 9px 12px; vertical-align: top; font-size: 14px; "
+          "line-height: 1.5; color: #1f2937; background: #ffffff; overflow-wrap: anywhere; word-break: break-word;")
+    head = (f"padding: 9px 12px; text-align: left; font-size: 14px; color: #ffffff; background: {ACCENT}; "
+            "font-weight: 700; overflow-wrap: anywhere;")
+    trs = []
+    for label, val in rows:
+        if label is None:
+            trs.append(f'<tr><th colspan="2" style="{head}">{esc(val)}</th></tr>')
+        else:
+            trs.append(f'<tr><th scope="row" style="{th}">{esc(label)}</th><td style="{td}">{esc(val)}</td></tr>')
+    if coords:
+        lat, lon = coords
+        link = (f'<a href="https://www.openstreetmap.org/?mlat={lat}&amp;mlon={lon}#map=12/{lat}/{lon}" '
+                'rel="noopener" target="_blank">haritada aç</a>')
+        trs.append(f'<tr><th scope="row" style="{th}">Koordinatlar</th><td style="{td}">{lat:.5f}, {lon:.5f} ({link})</td></tr>')
+    if not trs:
+        return ""
+    return ('<div style="max-width: 100%; margin: 1.2em 0; overflow: hidden; border-radius: 12px; '
+            'box-shadow: 0 2px 12px rgba(0,0,0,.08); border: 1px solid #e5e7eb;">'
+            '<table style="width: 100%; table-layout: fixed; border-collapse: collapse;">'
+            '<colgroup><col style="width: 38%;"><col style="width: 62%;"></colgroup>'
+            f'{"".join(trs)}</table></div>')
+
+
+def toc_html(entries):
+    if len(entries) < 3:
+        return ""
+    lis = "".join(f'<li style="margin: 0.3em 0;"><a href="#{esc(i)}" style="color: #0b5cad;">{esc(t)}</a></li>'
+                  for t, i in entries[:16])
+    return (f'<div style="margin: 1.4em 0; padding: 16px 22px; border-left: 5px solid {ACCENT}; {CARD_STYLE}">'
+            '<p style="margin: 0 0 0.5em; font-weight: 700; font-size: 1.1em;">İçindekiler</p>'
+            f'<ol style="margin: 0; padding-left: 1.4em; line-height: 1.6;">{lis}</ol></div>')
+
+
+def faq_pairs(group, name, rows, facts):
+    """Künyedeki gerçek değerlerden Sık Sorulan Sorular (yoksa boş)."""
+    if group not in ("il", "ilce"):
+        return []
+    f = {l: v for l, v in facts}
+    out = []
+    for lab in f:
+        if lab.startswith("Nüfus"):
+            out.append((f"{name} nüfusu ne kadar?", f"Vikipedi künyesine göre {name} için {tr_lower(lab)} {f[lab]} olarak belirtilmiştir."))
+    if "Yüzölçümü" in f:
+        out.append((f"{name} yüzölçümü ne kadar?", f"Vikipedi künyesine göre {name} için yüzölçümü {f['Yüzölçümü']} olarak belirtilmiştir."))
+    if "Plaka Kodu" in f:
+        out.append((f"{name} plaka kodu nedir?", f"{name} için plaka kodu {f['Plaka Kodu']} olarak belirtilmiştir."))
+    if "Alan Kodu" in f:
+        out.append((f"{name} alan kodu nedir?", f"{name} için telefon alan kodu {f['Alan Kodu']} olarak belirtilmiştir."))
+    if "Belediye Başkanı" in f:
+        out.append((f"{name} belediye başkanı kimdir?", f"Vikipedi künyesinde {name} belediye başkanı olarak {f['Belediye Başkanı']} yer almaktadır."))
+    il = parent_il(rows) if group == "ilce" else ""
+    if il:
+        out.append((f"{name} hangi ile bağlı?", f"{name}, {il} iline bağlıdır."))
+    return out[:6]
+
+
+def faq_html(pairs):
+    if len(pairs) < 2:
+        return ""
+    items = "".join(f'<h3 style="{_HEAD_STYLES[3]}">{esc(q)}</h3><p style="margin: 0 0 0.8em;">{esc(a)}</p>' for q, a in pairs)
+    return (items + '<p style="font-size: 13px; opacity: .8;">Bu bilgiler Vikipedi’deki ilgili sürümden alınmıştır; '
+            'güncel olmayabilir.</p>')
+
+
+def style_lead_paragraph(blocks):
+    """Girişin ilk paragrafını biraz büyük puntoyla vurgular."""
+    out, done = [], False
+    for b in blocks:
+        if not done and b[0] == "html" and b[1].startswith("<p>"):
+            b, done = ("html", '<p style="font-size: 1.08em; line-height: 1.85;">' + b[1][3:]), True
+        out.append(b)
+    return out
+
 
 
 def block_chars(blocks):
@@ -1057,7 +1258,7 @@ def build_article(api, title, group, now, log=print):
     infos = api.image_info(files[: MAX_IMAGES * 2]) if files else {}
     used, count = set(), 0
 
-    def render_fig(f, cap, alt):
+    def render_fig(f, cap, alt, lead=False):
         nonlocal count
         k = fkey(f)
         info = infos.get(k)
@@ -1065,7 +1266,7 @@ def build_article(api, title, group, now, log=print):
             return None
         used.add(k)
         count += 1
-        return info, figure_html(f, cap, info, alt or real_title)
+        return info, figure_html(f, cap, info, alt or alt_text(real_title, cap), lead=lead)
 
     # kapak görseli: fotoğraf benzeri ilk görsel (bayrak/logo/harita değil); yoksa ilk geçerli görsel
     lead, lead_info = "", None
@@ -1073,52 +1274,56 @@ def build_article(api, title, group, now, log=print):
     valid = [(f, cap) for f, cap in cands if infos.get(fkey(f)) and accept_image(infos[fkey(f)])]
     pick = next(((f, cap) for f, cap in valid if lead_ok(f, infos[fkey(f)])), valid[0] if valid else None)
     if pick:
-        cap_txt = strip_tags(pick[1])
-        r = render_fig(pick[0], pick[1], f"{display_name(real_title)} – {cap_txt}" if cap_txt else display_name(real_title))
+        if LEAD_WIDTH > IMG_WIDTH:                         # kapak görseli daha yüksek çözünürlükte (1920 px) istenir
+            try:
+                big = api.image_info([pick[0]], width=LEAD_WIDTH).get(fkey(pick[0]))
+                if big and accept_image(big):
+                    infos[fkey(pick[0])] = big
+            except WikiError as e:
+                log(f"::warning::kapak görseli büyük boyutta alınamadı ({pick[0]}): {e}")
+        r = render_fig(pick[0], pick[1], alt_text(real_title, pick[1]), lead=True)
         if r:
             lead_info, lead = r
 
     first_h = next((i for i, b in enumerate(blocks) if b[0] == "h"), len(blocks))
-    t = esc(real_title)
+    facts = key_facts(rows)
+    name = display_name(real_title)
     out = [("t", lead)] if lead else []
+    if facts:
+        out.append(("t", tiles_html(facts)))                     # Nüfus / Yüzölçümü / Plaka / Belediye Başkanı kutuları
 
     def emit(items):
         for b in items:
             if b[0] == "h":
-                out.append(("h", b[1], f"<h{b[1]}>{esc(b[2])}</h{b[1]}>", b[2]))
+                out.append(("h", b[1], b[2], True))
             elif b[0] == "html":
                 out.append(("t", b[1]))
             elif b[0] == "fig":
-                r = render_fig(b[1], b[2], strip_tags(b[2]))
+                r = render_fig(b[1], b[2], alt_text(real_title, b[2]))
                 if r:
                     out.append(("t", r[1]))
 
-    emit(blocks[:first_h])
+    emit(style_lead_paragraph(blocks[:first_h]))
+    out.append(("t", TOC_MARK))
 
     # künye (bilgi kutusu)
-    lines = []
-    for label, val in rows:
-        lines.append(f"<b>— {esc(val)} —</b>" if label is None else f"<b>{esc(label)}:</b> {esc(val)}")
-    if coords:
-        lat, lon = coords
-        lines.append(f'<b>Koordinatlar:</b> {lat:.5f}, {lon:.5f} (<a href="https://www.openstreetmap.org/?mlat={lat}&amp;mlon={lon}'
-                     f'#map=12/{lat}/{lon}" rel="noopener" target="_blank">haritada aç</a>)')
-    if lines:
-        out.append(("h", 2, f"<h2>{t} Künyesi</h2>", None))
-        out.append(("t", "<p>" + "<br />".join(lines) + "</p>"))
-    extra_heading = bool(lines)
+    box = infobox_html(name, rows, coords)
+    if box:
+        out.append(("h", 2, f"{name} Künyesi", False))
+        out.append(("t", box))
+    extra_heading = bool(box)
     for f, cap in info_units:                                   # bilgi kutusundaki diğer görseller (bayrak, harita, logo...)
-        r = render_fig(f, cap, strip_tags(cap) or real_title)
+        r = render_fig(f, cap, alt_text(real_title, cap) if strip_tags(cap) else f"{name} görseli")
         if r:
             if not extra_heading:
-                out.append(("h", 2, f"<h2>{t} Görselleri</h2>", None))
+                out.append(("h", 2, f"{name} Görselleri", False))
                 extra_heading = True
             out.append(("t", r[1]))
 
     emit(blocks[first_h:])
 
-    # boş başlıkları ayıkla
-    final, items, heads = [], out, []
+    # boş başlıkları ayıkla, başlıklara kimlik ver, içindekileri çıkar
+    final, items, heads, toc, ids = [], out, [], [], set()
     for i, it in enumerate(items):
         if it[0] == "h":
             lvl, j, has = it[1], i + 1, False
@@ -1131,12 +1336,27 @@ def build_article(api, title, group, now, log=print):
                 j += 1
             if not has:
                 continue
-            final.append(it[2])
+            sid, n = "b-" + slugify(it[2]), 2
+            while sid in ids:
+                sid, n = f"b-{slugify(it[2])}-{n}", n + 1
+            ids.add(sid)
+            final.append(heading_html(lvl, it[2], sid))
             if it[3]:
-                heads.append(it[3])
+                heads.append(it[2])
+                if lvl == 2:
+                    toc.append((it[2], sid))
         else:
             final.append(it[1])
 
+    pairs = faq_pairs(group, name, rows, facts)
+    faq = faq_html(pairs)
+    if faq:
+        toc.append(("Sık Sorulan Sorular", "b-sik-sorulan-sorular"))
+        final.append(heading_html(2, "Sık Sorulan Sorular", "b-sik-sorulan-sorular"))
+        final.append(faq)
+    final = [toc_html(toc) if x == TOC_MARK else x for x in final]
+
+    t = esc(real_title)
     link = wiki_url(wiki_title)
     note = ("<hr />"
             f'<p><small>Bu makale Vikipedi\'deki <a href="{esc(link)}" rel="noopener" target="_blank">“{t}”</a> maddesinden '
@@ -1149,7 +1369,7 @@ def build_article(api, title, group, now, log=print):
         note += (" Bu makale ayrıca aynı lisansla şu Vikipedi maddelerinden alınan bölümleri içerir: "
                  + ", ".join(f'<a href="{esc(x["oldid"])}" rel="noopener" target="_blank">{esc(x["name"])}</a>' for x in sources) + ".")
     final.append(note + "</small></p>")
-    body = "\n".join(final) + "\n"
+    body = f'<div style="{WRAP_STYLE}">\n' + "\n".join(x for x in final if x) + "\n</div>\n"
 
     lead_p = next((b[1] for b in blocks if b[0] == "html" and b[1].startswith("<p>")), "")
     desc = seo_description(strip_tags(lead_p) or real_title)
