@@ -78,7 +78,15 @@ SUB_MIN_CHARS = _int("SUB_MIN_CHARS", 600)       # bundan kısa ayrıntılı mad
 SUB_MAX_CHARS = _int("SUB_MAX_CHARS", 80000)     # tek ayrıntılı maddeden en çok metin (bölüm sınırında kesilir)
 TOTAL_MAX_CHARS = _int("TOTAL_MAX_CHARS", 500000)  # makalenin toplam metin sınırı (aşılınca yeni ayrıntılı madde eklenmez)
 BUILD_VERSION = 3          # 3: premium düzen, yeni başlık biçimi (il/ilçe makaleleri yeniden üretilir)
-ACCENT = "#c8102e"         # başlık/kutu vurgu rengi
+# Sitenin temasındaki CSS değişkenleri (style.css :root ve [data-skin=orange]); ikinci değer tema dışı okuyucular için yedektir.
+V_NAVY = "var(--navy, #1f6bf0)"      # tema vurgu rengi (başlıklar bununla boyanır)
+V_LINE = "var(--line, #c5d5f2)"      # ince çizgi
+V_SOFT = "var(--soft, #f3f7ff)"      # açık zemin
+V_SOFT2 = "var(--soft-2, #dbe6fb)"   # biraz koyu zemin
+V_PAGE = "var(--page, #ffffff)"      # sayfa/kart zemini
+V_TEXT = "var(--text, #000000)"      # metin
+V_MUTED = "var(--muted, #3a4f84)"    # ikincil metin
+V_RADIUS = "var(--radius, 3px)"      # köşe yuvarlaklığı
 TITLE_SEP = ": "           # "Adapazarı (Sakarya): Tarih, ..." ayracı
 POOL_VERSION = 2
 SPARQL_URL = "https://query.wikidata.org/sparql"
@@ -610,7 +618,7 @@ def is_figure_block(tag):
     return tag.name == "ul" and bool(tag.find(class_="gallerybox"))
 
 
-def list_html(tag):
+def list_html(tag, top=True):
     name = tag.name
     items = []
     for li in tag.find_all(["li", "dt", "dd"], recursive=False):
@@ -618,17 +626,20 @@ def list_html(tag):
             continue
         parts = []
         for ch in li.children:
-            parts.append(list_html(ch) if isinstance(ch, Tag) and ch.name in BLOCK_LIST else inline(ch))
+            parts.append(list_html(ch, top=False) if isinstance(ch, Tag) and ch.name in BLOCK_LIST else inline(ch))
         body = "".join(parts).strip()
         if re.sub(r"<[^>]+>|\s|&nbsp;", "", body):
             items.append(f"<{li.name}>{body}</{li.name}>")
-    style = "margin: 0.8em 0; padding-left: 1.5em; line-height: 1.7;" if name != "dl" else "margin: 0.8em 0;"
-    return f'<{name} style="{style}">{"".join(items)}</{name}>' if items else ""
+    if not items:
+        return ""
+    style = ' style="margin: 0 0 0.9em;"' if top else ""        # girinti, boyut ve satır aralığı temadan gelir
+    return f'<{name}{style}>{"".join(items)}</{name}>'
 
 
-TD_STYLE = ("border: 1px solid #e5e7eb; padding: 8px 10px; vertical-align: top; font-size: 14px; line-height: 1.5; "
-            "color: #1f2937; overflow-wrap: anywhere; word-break: break-word;")
-TH_STYLE = TD_STYLE + " background: #f3f4f6; font-weight: 700; text-align: left;"
+# Serbest düzenli (wikitable) hücrelerde "anywhere" kullanılmaz: sütunları 1 harfe sıkıştırıp kelimeleri bozar. break-word
+# yalnızca sığmayan çok uzun sözcüğü böler; geniş tablo sıkışmak yerine kapsayıcısında yatay kayar.
+TD_STYLE = f"vertical-align: top; color: {V_TEXT}; overflow-wrap: break-word; word-break: normal;"
+TH_STYLE = TD_STYLE + f" background: {V_SOFT2}; font-weight: 700; text-align: left;"
 
 
 def table_html(tag):
@@ -646,8 +657,8 @@ def table_html(tag):
                 v = (c.get(a) or "").strip()
                 if v.isdigit() and 1 < int(v) <= 50:
                     attrs += f' {a}="{int(v)}"'
-            zebra = "" if c.name == "th" or len(rows) % 2 == 0 else " background: #f9fafb;"
-            style = (TH_STYLE if c.name == "th" else TD_STYLE + (zebra or " background: #ffffff;"))
+            bg = V_SOFT if len(rows) % 2 else V_PAGE
+            style = TH_STYLE if c.name == "th" else TD_STYLE + f" background: {bg};"
             cells.append(f'<{c.name}{attrs} style="{style}">{body}</{c.name}>')
         if cells:
             widest = max(widest, len(cells))
@@ -655,11 +666,11 @@ def table_html(tag):
     if not rows or not re.sub(r"<[^>]+>|\s|&nbsp;", "", "".join(rows)):
         return ""
     cap = tag.find("caption")
-    cap_html = (f'<caption style="caption-side: top; text-align: left; font-weight: 700; padding: 6px 2px;">'
+    cap_html = (f'<caption style="caption-side: top; text-align: left; font-weight: 700; padding: 6px 2px; color: {V_MUTED};">'
                 f"{inline(cap).strip()}</caption>") if cap is not None and inline(cap).strip() else ""
     minw = f" min-width: {min(900, 110 * widest)}px;" if widest >= 5 else ""         # çok sütunlu tablo sıkışmasın, kaydırılsın
     return ('<div style="overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; margin: 1.3em 0;">'
-            f'<table style="border-collapse: collapse; width: 100%;{minw}">'
+            f'<table style="display: table; border-collapse: collapse; width: 100%;{minw}">'
             f'{cap_html}{"".join(rows)}</table></div>')
 
 
@@ -776,8 +787,7 @@ def sanitize(parse_html, title):
         if name == "blockquote":
             body = inline(el).strip()
             if body:
-                blocks.append(("html", f'<blockquote style="margin: 1.2em 0; padding: 0.6em 1.1em; border-left: 4px solid {ACCENT}; '
-                                    f'background: rgba(128,128,128,.10);">{body}</blockquote>'))
+                blocks.append(("html", f"<blockquote>{body}</blockquote>"))
             return
         if name == "table":
             if el.find("img") and not el.find(class_="wikitable") and "wikitable" not in cls and len(plain(el)) < 400:
@@ -863,13 +873,12 @@ def figure_html(name, cap_html, info, alt, lead=False):
     dims = f' width="{int(w)}" height="{int(h)}"' if w and h else ""
     cap = (cap_html + "<br />" if cap_html else "") + credit_html(info)
     load = 'loading="eager" fetchpriority="high"' if lead else 'loading="lazy"'
-    return (f'<figure style="margin: {"0 0 1.4em" if lead else "1.7em 0"}; padding: 0; text-align: center; max-width: 100%;">'
-            f'<a href="{esc(info.get("url") or url)}" rel="noopener" target="_blank">'
+    return (f'<figure style="margin: {"0 0 1.4em" if lead else "1.5em 0"}; padding: 0; text-align: center; max-width: 100%;">'
             f'<img alt="{esc(alt)}" {load} decoding="async" src="{esc(url)}"{dims} '
-            'style="display: block; width: auto; max-width: 100%; height: auto; margin: 0 auto; border-radius: 12px; '
-            'box-shadow: 0 6px 24px rgba(0,0,0,.18);" /></a>'
-            '<figcaption style="font-size: 14px; line-height: 1.5; margin-top: 0.7em; opacity: .88; overflow-wrap: anywhere;">'
-            f'{cap}</figcaption></figure>')
+            f'style="display: block; width: auto; max-width: 100%; height: auto; margin: 0 auto; '
+            f'border: 1px solid {V_LINE}; border-radius: {V_RADIUS};" />'
+            f'<figcaption style="font-size: 0.85em; line-height: 1.5; margin-top: 0.6em; color: {V_MUTED}; '
+            f'overflow-wrap: anywhere;">{cap}</figcaption></figure>')
 
 
 # ----------------------------------------------------------------------------- makale
@@ -979,15 +988,14 @@ def feed_labels(group, label, name, rows):
 
 # ----------------------------------------------------------------------------- premium düzen
 _TR_ASCII = str.maketrans("çğıöşüÇĞİÖŞÜâîûÂÎÛ", "cgiosuCGIOSUaiuAIU")
-WRAP_STYLE = ("max-width: 100%; box-sizing: border-box; overflow-wrap: anywhere; word-wrap: break-word; "
-              "line-height: 1.75; font-size: 17px;")
-CARD_STYLE = ("box-sizing: border-box; background: #ffffff; color: #1f2937; border: 1px solid #e5e7eb; "
-              "border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.08);")
+WRAP_STYLE = "max-width: 100%; box-sizing: border-box; overflow-wrap: anywhere; word-wrap: break-word;"   # boyut/satır aralığı temadan
+CARD_STYLE = (f"box-sizing: border-box; background: {V_PAGE}; color: {V_TEXT}; border: 1px solid {V_LINE}; "
+              f"border-radius: {V_RADIUS}; box-shadow: 0 1px 3px rgba(0,0,0,.08);")
+# Başlık rengi, boyutu ve boşluğu temadan gelir (.post-body h2,h3,h4); burada yalnızca ince alt çizgi ve çapa ofseti var.
 _HEAD_STYLES = {
-    2: f"margin: 2em 0 0.6em; padding: 0.15em 0 0.15em 0.6em; border-left: 5px solid {ACCENT}; "
-       "font-size: 1.55em; line-height: 1.3; color: inherit; overflow-wrap: anywhere;",
-    3: "margin: 1.6em 0 0.5em; font-size: 1.28em; line-height: 1.35; color: inherit; overflow-wrap: anywhere;",
-    4: "margin: 1.3em 0 0.4em; font-size: 1.12em; line-height: 1.4; color: inherit; overflow-wrap: anywhere;",
+    2: f"padding-bottom: 0.25em; border-bottom: 2px solid {V_LINE}; scroll-margin-top: 12px;",
+    3: "scroll-margin-top: 12px;",
+    4: "scroll-margin-top: 12px;",
 }
 TOC_MARK = "<!--yr-toc-->"
 
@@ -1052,39 +1060,41 @@ def tiles_html(facts):
     if not facts:
         return ""
     tiles = "".join(
-        f'<div style="display: inline-block; vertical-align: top; width: calc(33.333% - 14px); min-width: 150px; '
-        f'margin: 6px; padding: 14px 12px; border-top: 4px solid {ACCENT}; text-align: center; {CARD_STYLE}">'
-        f'<div style="font-size: 13px; color: #6b7280; line-height: 1.3;">{esc(l)}</div>'
-        f'<div style="font-size: 20px; font-weight: 700; line-height: 1.3; margin-top: 4px;">{esc(v)}</div></div>'
+        f'<div style="{CARD_STYLE} border-top: 3px solid {V_NAVY}; display: inline-block; vertical-align: top; '
+        f'width: calc(33.333% - 14px); min-width: 150px; margin: 6px; padding: 12px 10px; text-align: center;">'
+        f'<div style="font-size: 0.85em; color: {V_MUTED}; line-height: 1.3;">{esc(l)}</div>'
+        f'<div style="font-size: 1.3em; font-weight: 700; line-height: 1.3; margin-top: 4px; color: {V_NAVY};">{esc(v)}</div></div>'
         for l, v in facts)
     return f'<div style="text-align: center; margin: 1.2em -6px;">{tiles}</div>'
 
 
+_URL_ROW = re.compile(r"^(?:https?://|www\.)\S+$", re.I)
+_URL_LABEL = re.compile(r"(web\s*sitesi|internet\s*sitesi|resm[iî]\s*site|website)", re.I)
+
+
 def infobox_html(name, rows, coords):
-    """Künye: sabit düzenli, taşmayan iki sütunlu kart tablo."""
-    th = ("border-bottom: 1px solid #e5e7eb; padding: 9px 12px; vertical-align: top; text-align: left; "
-          "font-size: 14px; line-height: 1.5; color: #374151; background: #f9fafb; font-weight: 700; "
-          "overflow-wrap: anywhere; word-break: break-word;")
-    td = ("border-bottom: 1px solid #e5e7eb; padding: 9px 12px; vertical-align: top; font-size: 14px; "
-          "line-height: 1.5; color: #1f2937; background: #ffffff; overflow-wrap: anywhere; word-break: break-word;")
-    head = (f"padding: 9px 12px; text-align: left; font-size: 14px; color: #ffffff; background: {ACCENT}; "
-            "font-weight: 700; overflow-wrap: anywhere;")
+    """Künye: sabit düzenli, taşmayan iki sütunlu kart tablo (renkler tema değişkenlerinden)."""
+    base = f"border: 0; border-bottom: 1px solid {V_LINE}; vertical-align: top; text-align: left; overflow-wrap: anywhere; word-break: break-word;"
+    th = base + f" padding: 8px 12px; background: {V_SOFT}; color: {V_TEXT}; font-weight: 700;"
+    td = base + f" padding: 8px 12px; background: {V_PAGE}; color: {V_TEXT};"
+    head = (f"border: 0; padding: 8px 12px; text-align: left; font-weight: 700; color: {V_PAGE}; background: {V_NAVY}; "
+            "overflow-wrap: anywhere;")
     trs = []
     for label, val in rows:
         if label is None:
             trs.append(f'<tr><th colspan="2" style="{head}">{esc(val)}</th></tr>')
+        elif _URL_ROW.match(val.strip()) or _URL_LABEL.search(label):
+            continue                                                  # dış site adresleri makaleye alınmaz
         else:
             trs.append(f'<tr><th scope="row" style="{th}">{esc(label)}</th><td style="{td}">{esc(val)}</td></tr>')
     if coords:
         lat, lon = coords
-        link = (f'<a href="https://www.openstreetmap.org/?mlat={lat}&amp;mlon={lon}#map=12/{lat}/{lon}" '
-                'rel="noopener" target="_blank">haritada aç</a>')
-        trs.append(f'<tr><th scope="row" style="{th}">Koordinatlar</th><td style="{td}">{lat:.5f}, {lon:.5f} ({link})</td></tr>')
+        trs.append(f'<tr><th scope="row" style="{th}">Koordinatlar</th><td style="{td}">{lat:.5f}, {lon:.5f}</td></tr>')
     if not trs:
         return ""
-    return ('<div style="max-width: 100%; margin: 1.2em 0; overflow: hidden; border-radius: 12px; '
-            'box-shadow: 0 2px 12px rgba(0,0,0,.08); border: 1px solid #e5e7eb;">'
-            '<table style="width: 100%; table-layout: fixed; border-collapse: collapse;">'
+    return (f'<div style="max-width: 100%; margin: 1.2em 0; overflow: hidden; border: 1px solid {V_LINE}; '
+            f'border-radius: {V_RADIUS}; box-shadow: 0 1px 3px rgba(0,0,0,.08);">'
+            '<table style="display: table; width: 100%; table-layout: fixed; border-collapse: collapse;">'
             '<colgroup><col style="width: 38%;"><col style="width: 62%;"></colgroup>'
             f'{"".join(trs)}</table></div>')
 
@@ -1092,11 +1102,10 @@ def infobox_html(name, rows, coords):
 def toc_html(entries):
     if len(entries) < 3:
         return ""
-    lis = "".join(f'<li style="margin: 0.3em 0;"><a href="#{esc(i)}" style="color: #0b5cad;">{esc(t)}</a></li>'
-                  for t, i in entries[:16])
-    return (f'<div style="margin: 1.4em 0; padding: 16px 22px; border-left: 5px solid {ACCENT}; {CARD_STYLE}">'
-            '<p style="margin: 0 0 0.5em; font-weight: 700; font-size: 1.1em;">İçindekiler</p>'
-            f'<ol style="margin: 0; padding-left: 1.4em; line-height: 1.6;">{lis}</ol></div>')
+    lis = "".join(f'<li style="margin: 0.3em 0;"><a href="#{esc(i)}">{esc(t)}</a></li>' for t, i in entries[:16])
+    return (f'<div style="{CARD_STYLE} border-left: 4px solid {V_NAVY}; margin: 1.4em 0; padding: 14px 20px;">'
+            f'<p style="margin: 0 0 0.5em; font-weight: 700; color: {V_NAVY};">İçindekiler</p>'
+            f'<ol style="margin: 0;">{lis}</ol></div>')
 
 
 def faq_pairs(group, name, rows, facts):
@@ -1125,20 +1134,9 @@ def faq_pairs(group, name, rows, facts):
 def faq_html(pairs):
     if len(pairs) < 2:
         return ""
-    items = "".join(f'<h3 style="{_HEAD_STYLES[3]}">{esc(q)}</h3><p style="margin: 0 0 0.8em;">{esc(a)}</p>' for q, a in pairs)
-    return (items + '<p style="font-size: 13px; opacity: .8;">Bu bilgiler Vikipedi’deki ilgili sürümden alınmıştır; '
-            'güncel olmayabilir.</p>')
-
-
-def style_lead_paragraph(blocks):
-    """Girişin ilk paragrafını biraz büyük puntoyla vurgular."""
-    out, done = [], False
-    for b in blocks:
-        if not done and b[0] == "html" and b[1].startswith("<p>"):
-            b, done = ("html", '<p style="font-size: 1.08em; line-height: 1.85;">' + b[1][3:]), True
-        out.append(b)
-    return out
-
+    items = "".join(f'<h3 style="{_HEAD_STYLES[3]}">{esc(q)}</h3><p>{esc(a)}</p>' for q, a in pairs)
+    return items + (f'<p><small style="color: {V_MUTED};">Bu bilgiler Vikipedi’deki ilgili sürümden alınmıştır; '
+                    'güncel olmayabilir.</small></p>')
 
 
 def block_chars(blocks):
@@ -1303,7 +1301,7 @@ def build_article(api, title, group, now, log=print):
                 if r:
                     out.append(("t", r[1]))
 
-    emit(style_lead_paragraph(blocks[:first_h]))
+    emit(blocks[:first_h])
     out.append(("t", TOC_MARK))
 
     # künye (bilgi kutusu)
@@ -1358,7 +1356,7 @@ def build_article(api, title, group, now, log=print):
 
     t = esc(real_title)
     link = wiki_url(wiki_title)
-    note = ("<hr />"
+    note = (f'<hr style="border: 0; border-top: 1px solid {V_LINE}; margin: 1.6em 0 1em;" />'
             f'<p><small>Bu makale Vikipedi\'deki <a href="{esc(link)}" rel="noopener" target="_blank">“{t}”</a> maddesinden '
             f'alınmıştır (<a href="{esc(oldid_url(wiki_title, revid))}" rel="noopener" target="_blank">kullanılan sürüm</a>). '
             f'Madde metni <a href="{ATTRIBUTION_URL}" rel="noopener" target="_blank">Creative Commons '
@@ -1369,7 +1367,7 @@ def build_article(api, title, group, now, log=print):
         note += (" Bu makale ayrıca aynı lisansla şu Vikipedi maddelerinden alınan bölümleri içerir: "
                  + ", ".join(f'<a href="{esc(x["oldid"])}" rel="noopener" target="_blank">{esc(x["name"])}</a>' for x in sources) + ".")
     final.append(note + "</small></p>")
-    body = f'<div style="{WRAP_STYLE}">\n' + "\n".join(x for x in final if x) + "\n</div>\n"
+    body = f'<div style="{WRAP_STYLE}" lang="tr">\n' + "\n".join(x for x in final if x) + "\n</div>\n"
 
     lead_p = next((b[1] for b in blocks if b[0] == "html" and b[1].startswith("<p>")), "")
     desc = seo_description(strip_tags(lead_p) or real_title)

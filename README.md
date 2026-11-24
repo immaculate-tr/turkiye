@@ -69,3 +69,13 @@ makalenin lisans notunda listelenir. Kapatmak için `FOLLOW_MAIN: "0"`.
 Yeni başlık biçimi ve düzen yalnızca **yeni üretilen** makalelere uygulanır. Eski sürümle üretilmiş il/ilçe makaleleri ilk
 çalışmada kayıttan çıkarılır ve yeni biçimde, aynı kimlikle yeniden üretilir (her çalışmada `PER_RUN` kadar). Blogger'a
 önceden aktarılmış yazılar RSS'ten otomatik güncellenmez; gerekirse bu yazıları Blogger'da silip yeniden içe aktarın.
+
+## Tema uyumu ve HTML doğrulama
+* **Tema uyumu (style.css'e göre):** Hiçbir renk sabit değil; hepsi temanın CSS değişkenlerinden okunur
+  (`var(--navy, …)`, `--line`, `--soft`, `--soft-2`, `--page`, `--text`, `--muted`, `--radius`). Mavi ve altın (`data-skin=orange`) tema
+  otomatik uyar; yedek değerler yalnızca tema dışı okuyucular içindir. Başlık rengi/boyutu/boşluğu, blockquote, liste girintisi, hücre
+  yazı boyutu ve tablo kenarlığı temadan gelir, makale bunları ezmez. Görseller bağlantıya sarılmaz; temanın kendi görsel büyütücüsü çalışır.
+  Künyedeki dış site adresleri ve harita bağlantısı makaleye alınmaz.
+* **HTML denetimi:** `tests/htmlcheck.py` üretilen makaleleri HTML5 içerik modeline göre denetler (etiket eşleşmesi, tablo/liste/figür yapısı,
+  benzersiz id, çalışan `#` bağlantıları, görsel nitelikleri, başlık sırası). Bu resmi W3C doğrulayıcısının yerine geçmez;
+  yayın öncesi bir örneği https://validator.w3.org/nu/ adresinde de denemeniz önerilir.
