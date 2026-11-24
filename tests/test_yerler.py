@@ -12,6 +12,10 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import yerlerrss as y  # noqa: E402
+try:
+    from tests import htmlcheck  # noqa: E402
+except ImportError:  # pragma: no cover
+    import htmlcheck  # noqa: E402
 
 NS = {"c": "http://purl.org/rss/1.0/modules/content/", "m": "http://search.yahoo.com/mrss/"}
 NOW = datetime(2026, 11, 21, 6, 0, 0, tzinfo=timezone.utc)
@@ -342,7 +346,7 @@ class TestArticle(Base):
         self.assertRegex(body, r">Yönetim</th></tr>")
         self.assertNotRegex(body, r">Hatay</th></tr>")
         self.assertIn("36.20000, 36.16000", body)
-        self.assertIn("openstreetmap.org", body)
+        self.assertNotIn("openstreetmap.org", body)
         self.assertNotIn("Boş bölüm", body)                                         # boş başlık ayıklandı
         for bad in ("Kaynakça", "Dış bağlantılar", "Ayrıca bakınız", "[1]", "reflist"):
             self.assertNotIn(bad, body)
@@ -980,3 +984,75 @@ class TestPremiumLayout(Base):
         (rec, body), _ = self.article()
         self.assertIn("Creative Commons Atıf-AynıLisanslaPaylaş 4.0", body)
         self.assertTrue(body.rstrip().endswith("</div>"))
+
+
+class TestHtmlValidity(Base):
+    """Üretilen makale HTML'i HTML5 içerik modeline uygun olmalı (tests/htmlcheck.py)."""
+
+    def test_checker_catches_errors(self):
+        for bad in ("<p>a<div>b</div></p>", "<div><b>x</div></b>", '<img src="https://x/y.jpg" alt="">', "<div><li>x</li></div>",
+                    '<h2 id="a">x</h2><h2 id="a">y</h2>', '<a href="#yok">x</a>', "<center>x</center>",
+                    '<a href="https://a"><a href="https://b">x</a></a>', "<h2>a</h2><h4>b</h4>"):
+            self.assertTrue(htmlcheck.check(bad), bad)
+        self.assertEqual(htmlcheck.check('<div><p>x</p><ul><li>a</li></ul></div>'), [])
+
+    def test_generated_articles_are_valid(self):
+        fake = TestMainArticles.fake(self)
+        cases = [(FakeWiki(pages={"Hatay": page("Hatay", 5)}, coords={"Hatay": (36.2, 36.1)}), "Hatay", "il"),
+                 (FakeWiki(pages={"Adapazarı": page("Adapazarı", 6, text=INFOBOX_SECTIONS)}, coords={"Adapazarı": (40.7, 30.4)}), "Adapazarı", "ilce"),
+                 (fake, "Hatay", "il")]
+        for fk, title, group in cases:
+            rec, body = y.build_article(api_for(fk), title, group, NOW)
+            self.assertEqual(htmlcheck.check(body), [], f"{title}/{group}")
+
+    def article_body(self, text=INFOBOX_SECTIONS, group="ilce", title="Adapazarı"):
+        fake = FakeWiki(pages={title: page(title, 6, text=text)}, coords={title: (40.7, 30.4)})
+        return y.build_article(api_for(fake), title, group, NOW)[1]
+
+    def test_headings_left_to_theme(self):
+        """Tema `.post-body h2/h3/h4` rengi, boyutu ve boşluğunu veriyor; satır içi stil bunları ezmemeli."""
+        body = self.article_body()
+        heads = re.findall(r"<h[234][^>]*>", body)
+        self.assertGreaterEqual(len(heads), 5)
+        for h in heads:
+            self.assertNotRegex(h, r"(?<![-\w])(color|font-size|font-weight|line-height|margin):", h)
+        self.assertIn('lang="tr"', body)
+
+    def test_only_theme_variables_for_colors(self):
+        """Hiçbir renk sabit değil: hepsi var(--tema-değişkeni, yedek) içinde."""
+        body = self.article_body()
+        styles = " ".join(re.findall(r'style="([^"]*)"', body))
+        bare = re.sub(r"var\([^()]*\)", "", styles)
+        self.assertNotRegex(bare, r"#[0-9a-fA-F]{3,8}\b")
+        self.assertNotRegex(bare, r"rgb\((?!0,\s*0,\s*0)")
+        for var in ("--navy", "--line", "--soft", "--page", "--text", "--muted", "--radius"):
+            self.assertIn(f"var({var},", body)
+        self.assertEqual(len(re.findall(r"var\(--[\w-]+\)", styles)), 0)            # her değişkenin yedeği var
+
+    def test_theme_owned_elements_not_overridden(self):
+        body = self.article_body(text=SAMPLE.replace("Hatay", "Adapazarı"))
+        self.assertNotRegex(body, r"<blockquote[^ >]* style")                         # tema blockquote'u biçimlendirir
+        self.assertNotRegex(body, r"<(td|th|p)[^>]*font-size")                        # tema --fs-body'yi !important verir
+        self.assertNotRegex(body, r"<(ul|ol)[^>]*padding")                            # liste girintisi temadan
+        self.assertNotIn("<a ", re.sub(r"<figcaption.*?</figcaption>|<p><small>.*?</small></p>", "", body, flags=re.S)
+                         .replace("<a href=\"#", "<x "))                               # görsel/metin bağlantısı yok
+
+    def test_images_not_wrapped_in_links(self):
+        fake = FakeWiki(pages={"Hatay": page("Hatay", 4242)}, coords={"Hatay": (36.2, 36.16)})
+        body = y.build_article(api_for(fake), "Hatay", "il", NOW)[1]
+        self.assertIn("<img", body)
+        self.assertNotRegex(body, r"<a[^>]*>\s*<img")                                # tema kendi görsel büyütücüsünü kullanır
+
+    def test_infobox_drops_external_site_rows(self):
+        rows = [("İl", "Sakarya"), ("Web sitesi", "www.adapazari.bel.tr"), ("Resmî site", "x"), ("Başka", "https://a.example/b")]
+        html_ = y.infobox_html("Adapazarı", rows, (40.7, 30.4))
+        self.assertIn("Sakarya", html_)
+        for gone in ("adapazari.bel.tr", "Resmî site", "a.example"):
+            self.assertNotIn(gone, html_)
+        self.assertNotIn("openstreetmap", html_)
+        self.assertIn("40.70000, 30.40000", html_)
+
+    def test_table_displays_as_table_inside_theme_block_rule(self):
+        """Tema `.post-body table{display:block}` yapıyor; sabit düzen için satır içi display:table şart."""
+        self.assertIn("display: table", self.article_body())
+        self.assertIn("table-layout: fixed", self.article_body())
